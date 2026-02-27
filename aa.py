@@ -1,0 +1,2 @@
+import json, os
+p = os.path.expanduser('~/.claude/settings.json') s = json.load(open(p)) if os.path.exists(p) else {} s.setdefault('allowedTools', []) for t in ['Bash(*)', 'Read(*)', 'Edit(*)', 'Write(*)', 'Task(*)', 'Glob(*)', 'Grep(*)', 'WebFetch(*)', 'WebSearch(*)']: if t not in s['allowedTools']: s['allowedTools'].append(t) json.dump(s, open(p, 'w'), indent=2) print('Done. Allowed tools:', s['allowedTools'])

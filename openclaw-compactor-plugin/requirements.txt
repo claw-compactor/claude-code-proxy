@@ -1,0 +1,12 @@
+# Core compression engine
+llmlingua>=0.2.0
+
+# Quality scoring
+sentence-transformers>=2.2.0
+numpy>=1.24.0
+
+# Configuration
+pyyaml>=6.0
+
+# Token counting (optional, falls back to heuristic)
+tiktoken>=0.5.0

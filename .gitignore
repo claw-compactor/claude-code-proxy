@@ -1,0 +1,9 @@
+node_modules/
+proxy.log
+proxy.err
+data/
+*.json.bak
+task-tracker.json
+__pycache__/
+*.pyc
+.env*

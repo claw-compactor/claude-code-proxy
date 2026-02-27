@@ -1,0 +1,116 @@
+# OpenClaw Compactor Plugin Configuration
+# =========================================
+# Prompt compression for LLM token savings with quality preservation.
+
+# Compression settings
+compression:
+  # Target compression ratio (0.0-1.0). Lower = more aggressive.
+  # 0.5 = keep ~50% of tokens. Recommended range: 0.4-0.7
+  default_rate: 0.5
+
+  # Minimum token count to trigger compression.
+  # Prompts shorter than this are passed through unchanged.
+  min_tokens: 100
+
+  # Maximum token count for auto-trigger (PreToolUse hook).
+  # When prompt exceeds this, compression is applied automatically.
+  auto_trigger_threshold: 500
+
+  # Compute device for LLMLingua-2 model.
+  # "mps" for Apple Silicon, "cuda" for NVIDIA, "cpu" for fallback.
+  device: "mps"
+
+  # LLMLingua-2 model identifier.
+  model: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank"
+
+  # Auto-adjust rate based on content density detection.
+  # Structured content (lists, tables, code) gets higher retention.
+  auto_adjust: true
+
+  # Use lightweight rule-based compression when LLMLingua-2 is unavailable.
+  # Falls back automatically if llmlingua is not installed.
+  fallback_to_lightweight: true
+
+# Quality control
+quality:
+  # Minimum similarity score to accept compression (0.0-1.0).
+  # If compressed text scores below this, original text is returned.
+  floor: 0.70
+
+  # Whether to run quality check after compression.
+  # Disable for speed; enable for safety on critical prompts.
+  enabled: true
+
+  # English embedding model
+  en_model: "all-MiniLM-L6-v2"
+
+  # Multilingual embedding model (used for CJK content)
+  multilingual_model: "paraphrase-multilingual-MiniLM-L12-v2"
+
+# Language detection
+language:
+  # CJK ratio threshold for switching to Chinese-aware mode.
+  # Text with CJK ratio above this uses higher retention rates.
+  cjk_threshold: 0.3
+
+  # Rate boost for CJK-dominant text (added to requested rate).
+  cjk_rate_boost: 0.15
+
+  # Rate boost for mixed EN/CJK text.
+  mixed_rate_boost: 0.10
+
+# Hook configuration (PreToolUse auto-compression)
+hooks:
+  # Enable automatic prompt compression via PreToolUse hook.
+  auto_compress: true
+
+  # Only compress prompts longer than this many tokens.
+  trigger_threshold: 500
+
+  # Tools to intercept for auto-compression.
+  # These tool calls will have their prompt arguments compressed.
+  intercept_tools:
+    - "Bash"
+    - "Read"
+    - "WebFetch"
+
+  # Log compression results to this file (relative to plugin dir).
+  # Set to null to disable logging.
+  log_file: "compression_log.jsonl"
+
+  # --- PostToolUse hook configuration (v7.0) ---
+
+  # Enable automatic file compression after Write/Edit tool calls.
+  # When enabled, files modified by the agent are compressed in-place.
+  post_tool_auto_compress: true
+
+  # Token threshold for PostToolUse file compression.
+  # Files with fewer tokens than this are skipped.
+  # Lower than PreToolUse threshold since we're compressing files, not prompts.
+  post_tool_trigger_threshold: 200
+
+  # Directories to skip during PostToolUse auto-compression.
+  # Files inside these directories are never compressed.
+  post_tool_skip_dirs:
+    - ".git"
+    - "node_modules"
+    - "__pycache__"
+    - ".openclaw/sessions"
+    - ".venv"
+    - "venv"
+    - ".tox"
+    - ".mypy_cache"
+    - ".pytest_cache"
+    - "dist"
+    - "build"
+
+# Output control
+output:
+  # Append a concise instruction to compressed prompts.
+  # Helps the LLM produce focused responses from compressed context.
+  concise_inject: true
+
+  # The instruction appended to compressed prompts.
+  concise_message: >
+    Provide a complete answer covering all key points from the context.
+    Be direct and avoid repeating information already stated in the context.
