@@ -1,0 +1,65 @@
+# Self-Distillation Config — Claude Token Labeling Pipeline
+# =========================================================
+#
+# Gold-label generation settings for training the compactor model.
+# The Claude API produces per-token keep/drop labels that are then
+# used to fine-tune the lightweight LLMLingua-2 student model.
+
+# ── Labeling ──────────────────────────────────────────────
+
+labeling:
+  # Claude model used for gold-label generation.
+  # Opus produces the highest quality labels for distillation.
+  model: "claude-opus-4-6"
+
+  # Total number of samples to label.
+  # 15K samples provide a strong training signal for the student model.
+  num_samples: 15000
+
+  # Samples sent per API call.
+  # 20 keeps each request well within context-window limits.
+  batch_size: 20
+
+  # Maximum concurrent API requests.
+  # Keep at 2-3 to avoid 503 Queue-full errors from the Anthropic API.
+  concurrency: 2
+
+  # Maximum retries per batch on transient errors (429, 503).
+  max_retries: 5
+
+  # Base delay (seconds) for exponential backoff between retries.
+  base_retry_delay: 2.0
+
+# ── Data paths ────────────────────────────────────────────
+
+data:
+  # Input: unlabelled tokenised prompts (JSONL, one {"id","tokens"} per line).
+  input_file: "data/unlabelled_samples.jsonl"
+
+  # Output: gold-labelled samples (JSONL, adds "labels","keep_rate","rationale").
+  output_file: "data/gold_labels.jsonl"
+
+  # Errors encountered during labeling.
+  error_file: "data/gold_labels.errors.jsonl"
+
+# ── Student training ──────────────────────────────────────
+
+training:
+  # Epochs for fine-tuning the student compressor on gold labels.
+  epochs: 3
+
+  # Learning rate for student model fine-tuning.
+  learning_rate: 2.0e-5
+
+  # Training batch size (local GPU).
+  train_batch_size: 32
+
+  # Validation split ratio.
+  val_split: 0.1
+
+  # Minimum keep-rate in gold labels to include sample in training.
+  # Filters out degenerate labels that drop almost everything.
+  min_keep_rate: 0.15
+
+  # Maximum keep-rate (filters no-op labels).
+  max_keep_rate: 0.95
