@@ -217,46 +217,11 @@ function reapOrphanShells(allProcs, config) {
   return results;
 }
 
-/**
- * 2. Stuck proxy CLI workers
- *    Find the proxy server PID, then look for claude CLI children
- *    that have been running longer than the threshold.
- */
-function reapStuckProxyWorkers(allProcs, config) {
-  const results = [];
-
-  // Find the proxy server PID
-  const proxyProc = allProcs.find(
-    (p) => p.command.includes("node") && p.command.includes("server.mjs")
-  );
-  if (!proxyProc) return results;
-
-  // Find children of proxy that are claude CLI processes
-  const proxyChildren = allProcs.filter(
-    (p) =>
-      p.ppid === proxyProc.pid &&
-      p.command.includes("claude") &&
-      !p.command.includes("server.mjs")
-  );
-
-  for (const child of proxyChildren) {
-    if (child.ageSec < config.proxyIdleThresholdSec) continue;
-
-    const killed = killProcess(child.pid, false);
-    results.push(
-      Object.freeze({
-        category: "stuck_proxy_worker",
-        pid: child.pid,
-        ppid: child.ppid,
-        ageSec: child.ageSec,
-        command: child.command.slice(0, 120),
-        killed,
-      })
-    );
-  }
-
-  return results;
-}
+// NOTE: Proxy CLI workers are NOT reaped here.
+// The proxy has its own internal reaper (process-registry.mjs) that tracks
+// lastActivityAt per process and sweeps every 15s. It allows workers to live
+// up to 2hr (maxProcessAgeMs) / 1hr idle (maxIdleMs). The system reaper
+// cannot distinguish active vs idle workers, so it must NOT interfere.
 
 /**
  * 3. Orphan openclaw CLI commands + pipe helpers
@@ -350,7 +315,6 @@ export function createSystemReaper(options = {}) {
     totalKilled: 0,
     byCategory: Object.freeze({
       orphan_shell: 0,
-      stuck_proxy_worker: 0,
       orphan_cli: 0,
       orphan_helper: 0,
     }),
@@ -371,7 +335,7 @@ export function createSystemReaper(options = {}) {
 
     const results = [
       ...reapOrphanShells(allProcs, config),
-      ...reapStuckProxyWorkers(allProcs, config),
+      // Proxy workers handled by proxy's own process-registry.mjs reaper
       ...reapOrphanCli(allProcs, config),
     ];
 
