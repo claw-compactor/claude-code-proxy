@@ -35,6 +35,7 @@ import { createRateLimiter } from "./rate-limiter.mjs";
 import { createRedisClient } from "./redis-client.mjs";
 import { createSessionAffinity } from "./session-affinity.mjs";
 import { createSystemReaper } from "./system-reaper.mjs";
+import { createWarmPool } from "./worker-pool.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -390,6 +391,11 @@ const MAX_PROCESS_AGE_MS = parseInt(process.env.MAX_PROCESS_AGE_MS || "1800000",
 const MAX_IDLE_MS = parseInt(process.env.MAX_IDLE_MS || "600000", 10);                 // 10 min (was 2 min)
 const REAPER_INTERVAL_MS = parseInt(process.env.REAPER_INTERVAL_MS || "15000", 10);
 
+// Warm Worker Pool: pre-spawns CLI processes to eliminate cold-start latency
+const WARM_POOL_ENABLED = process.env.WARM_POOL_ENABLED !== "false"; // default: on
+const WARM_POOL_SIZE = parseInt(process.env.WARM_POOL_SIZE || "2", 10);
+const WARM_POOL_MAX_AGE_MS = parseInt(process.env.WARM_POOL_MAX_AGE_MS || "300000", 10); // 5 min
+
 // ============================================================
 // Rate Limits — 95% of Claude Max plan limits (shared globally)
 // ============================================================
@@ -490,6 +496,16 @@ const systemReaper = createSystemReaper({
 // Session affinity: sticky routing for conversation sessions
 const sessionAffinity = createSessionAffinity({ ttlMs: 5 * 60 * 1000 }); // 5 min — short TTL for better distribution
 
+// Warm worker pool: pre-spawns CLI processes to eliminate 2-5s cold start
+const warmPool = createWarmPool({
+  maxWarmPerKey: WARM_POOL_SIZE,
+  maxWarmAgeMs: WARM_POOL_MAX_AGE_MS,
+  enabled: WARM_POOL_ENABLED,
+  buildArgs: (model, isStream) => buildCliArgs(null, model, null, isStream),
+  buildEnv: (worker) => workerEnv(worker),
+  log: (msg) => console.log(`[${ts()}] ${msg}`),
+});
+
 // Wire reaper events into event log + SSE
 registry.onReap((zombie) => {
   const ageS = Math.round(zombie.age / 1000);
@@ -567,6 +583,7 @@ function gatherMetricsSnapshot() {
     events: counts,
     sessionAffinity: sessionAffinity.getStats(),
     systemReaper: systemReaper.getStats(),
+    warmPool: warmPool.status(),
   };
 }
 
@@ -680,16 +697,26 @@ function buildStdinPayload(prompt, systemPrompt) {
 
 function runCliOnce(prompt, model, systemPrompt, requestId = "", source = "", workerOverride = null, sessionKey = "") {
   return new Promise((resolve, reject) => {
-    const args = buildCliArgs(prompt, model, systemPrompt, false);
     const worker = workerOverride || getNextWorker(sessionKey);
     if (sessionKey) sessionAffinity.assign(sessionKey, worker.name);
-    console.log(`[${ts()}] CLIROUTER obj=${worker.name} bin=${worker.bin} reqId=${requestId} model=${model}`);
     recordWorkerRequest(worker.name);
     workerAcquire(worker.name);
-    const proc = spawn(worker.bin, args, {
-      env: workerEnv(worker),
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+
+    // Try warm pool first — get a pre-initialized process or spawn fresh
+    const warm = warmPool.acquire(model, false, worker);
+    let proc;
+    if (warm) {
+      proc = warm.proc;
+      console.log(`[${ts()}] CLIROUTER obj=${worker.name} bin=${worker.bin} reqId=${requestId} model=${model} WARM_HIT pid=${proc.pid}`);
+    } else {
+      const args = buildCliArgs(prompt, model, systemPrompt, false);
+      proc = spawn(worker.bin, args, {
+        env: workerEnv(worker),
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      console.log(`[${ts()}] CLIROUTER obj=${worker.name} bin=${worker.bin} reqId=${requestId} model=${model} COLD pid=${proc.pid || "?"}`);
+    }
+
     // Write full payload (system prompt + user prompt) to stdin
     if (proc.stdin) {
       proc.stdin.write(buildStdinPayload(prompt, systemPrompt));
@@ -776,11 +803,20 @@ async function runCli(prompt, model, systemPrompt, requestId = "", source = "", 
 }
 
 function spawnCliStream(prompt, model, systemPrompt, worker) {
-  const args = buildCliArgs(prompt, model, systemPrompt, true);
-  const proc = spawn(worker.bin, args, {
-    env: workerEnv(worker),
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+  // Try warm pool first
+  const warm = warmPool.acquire(model, true, worker);
+  let proc;
+  if (warm) {
+    proc = warm.proc;
+    console.log(`[${ts()}] STREAM_SPAWN worker=${worker.name} model=${model} WARM_HIT pid=${proc.pid}`);
+  } else {
+    const args = buildCliArgs(prompt, model, systemPrompt, true);
+    proc = spawn(worker.bin, args, {
+      env: workerEnv(worker),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    console.log(`[${ts()}] STREAM_SPAWN worker=${worker.name} model=${model} COLD pid=${proc.pid || "?"}`);
+  }
   // Write full payload (system prompt + user prompt) to stdin
   if (proc.stdin) {
     proc.stdin.write(buildStdinPayload(prompt, systemPrompt));
@@ -1960,6 +1996,10 @@ async function handleSystemReaperSweep(req, res) {
   sendJson(res, 200, { result });
 }
 
+function handleWarmPool(req, res) {
+  sendJson(res, 200, warmPool.status());
+}
+
 function handleZombies(req, res) {
   const zombies = registry.getZombies();
   const qs = queue.getStats();
@@ -2106,6 +2146,8 @@ const server = createServer(async (req, res) => {
       handleSystemReaper(req, res);
     } else if (url.pathname === "/system-reaper" && req.method === "POST") {
       await handleSystemReaperSweep(req, res);
+    } else if (url.pathname === "/warm-pool" && req.method === "GET") {
+      handleWarmPool(req, res);
     } else if (url.pathname === "/events" && req.method === "GET") {
       handleEvents(req, res, url);
     } else if (url.pathname === "/metrics/history" && req.method === "GET") {
@@ -2139,6 +2181,7 @@ function shutdown(signal) {
     registry.kill(entry.pid);
   }
 
+  warmPool.shutdown();
   registry.destroy();
   queue.destroy();
   metricsStore.destroy();
@@ -2186,6 +2229,19 @@ server.listen(PORT, "0.0.0.0", async () => {
 
   metricsStore.startSampler(gatherMetricsSnapshot);
 
+  // Pre-warm worker pool: spawn processes for the most common configs
+  if (WARM_POOL_ENABLED) {
+    const prewarmConfigs = [];
+    for (const worker of _workerPool) {
+      // Pre-warm sync sonnet (most common: batch labeler, general queries)
+      prewarmConfigs.push({ model: "sonnet", isStream: false, worker, count: 1 });
+      // Pre-warm stream sonnet (most common streaming config)
+      prewarmConfigs.push({ model: "sonnet", isStream: true, worker, count: 1 });
+    }
+    warmPool.prewarm(prewarmConfigs);
+    console.log(`[WarmPool] Pre-warmed ${prewarmConfigs.length} worker(s) across ${_workerPool.length} CLI router(s)`);
+  }
+
   console.log(`Claude Code Proxy v0.5.1`);
   console.log(`Listening on http://0.0.0.0:${PORT}`);
   console.log(`CLI Routers: ${_workerPool.map((w) => `obj${w.name}=${w.bin}`).join(" | ")} | Primary: obj${PRIMARY_WORKER}`);
@@ -2201,5 +2257,6 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`Source concurrency limits: ${srcLimits} (default=${DEFAULT_SOURCE_CONCURRENCY || "unlimited"})`);
   console.log(`Timeouts: sync=${SYNC_TIMEOUT_MS}ms stream=${STREAM_TIMEOUT_MS}ms`);
   console.log(`Heartbeat: opus=${HEARTBEAT_BY_MODEL.opus}ms sonnet=${HEARTBEAT_BY_MODEL.sonnet}ms haiku=${HEARTBEAT_BY_MODEL.haiku}ms`);
+  console.log(`Warm pool: ${WARM_POOL_ENABLED ? `enabled (size=${WARM_POOL_SIZE}, maxAge=${WARM_POOL_MAX_AGE_MS}ms)` : "disabled"}`);
   console.log(`Metrics store: ${metricsStore.getBufferSize()} historical snapshots loaded`);
 });
