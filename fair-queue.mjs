@@ -1,9 +1,12 @@
 /**
- * Fair Queue with Round-Robin Scheduling
+ * Fair Queue with Round-Robin Scheduling & Per-Source Concurrency Limits
  *
  * Ensures fair access when multiple OpenClaw instances share
  * one Claude Code proxy. Round-robin between sources,
  * priority support within each source's queue.
+ *
+ * Per-source concurrency limits prevent any single source from
+ * monopolizing all processing slots (e.g., batch labeler vs IM).
  *
  * All public methods return new objects (immutable pattern).
  * Internal state is encapsulated in closure.
@@ -18,6 +21,8 @@ export function createFairQueue(options = {}) {
     maxTotal = 100,
     queueTimeoutMs = 60000,
     maxLeaseMs = 600_000,
+    maxConcurrentPerSource = {},  // { "batch-labeler": 15 } — per-source active slot caps
+    defaultMaxConcurrentPerSource = 0,  // 0 = no limit (backwards compatible)
   } = options;
 
   let activeCount = 0;
@@ -30,14 +35,50 @@ export function createFairQueue(options = {}) {
   let nextLeaseId = 0;
   let activeLeases = new Map(); // leaseId -> { sourceId, acquiredAt }
 
+  // Per-source active slot counts
+  let activePerSource = new Map(); // sourceId -> count
+
   // Metrics (cumulative)
   let metrics = {
     totalProcessed: 0,
     totalTimedOut: 0,
     totalRejected: 0,
     totalLeaked: 0,
+    totalThrottled: 0,
     perSource: {},
   };
+
+  function getSourceConcurrencyLimit(sourceId) {
+    if (sourceId in maxConcurrentPerSource) {
+      return maxConcurrentPerSource[sourceId];
+    }
+    return defaultMaxConcurrentPerSource;
+  }
+
+  function getSourceActiveCount(sourceId) {
+    return activePerSource.get(sourceId) || 0;
+  }
+
+  function isSourceAtLimit(sourceId) {
+    const limit = getSourceConcurrencyLimit(sourceId);
+    if (limit <= 0) return false; // no limit
+    return getSourceActiveCount(sourceId) >= limit;
+  }
+
+  function incrementSourceActive(sourceId) {
+    activePerSource = new Map(activePerSource);
+    activePerSource.set(sourceId, getSourceActiveCount(sourceId) + 1);
+  }
+
+  function decrementSourceActive(sourceId) {
+    activePerSource = new Map(activePerSource);
+    const current = getSourceActiveCount(sourceId);
+    if (current <= 1) {
+      activePerSource.delete(sourceId);
+    } else {
+      activePerSource.set(sourceId, current - 1);
+    }
+  }
 
   // Periodic sweep for timed-out entries + leaked slots
   const sweepInterval = setInterval(() => {
@@ -73,6 +114,7 @@ export function createFairQueue(options = {}) {
         activeLeases = new Map(activeLeases);
         activeLeases.delete(leaseId);
         activeCount--;
+        decrementSourceActive(lease.sourceId);
         leakedCount++;
       }
     }
@@ -82,41 +124,49 @@ export function createFairQueue(options = {}) {
     }
   }, 5000);
 
+  function grantSlot(sourceId) {
+    activeCount++;
+    incrementSourceActive(sourceId);
+    metrics = { ...metrics, totalProcessed: metrics.totalProcessed + 1 };
+
+    const srcStats = metrics.perSource[sourceId] || { processed: 0, throttled: 0 };
+    metrics = {
+      ...metrics,
+      perSource: {
+        ...metrics.perSource,
+        [sourceId]: { ...srcStats, processed: srcStats.processed + 1 },
+      },
+    };
+
+    const leaseId = nextLeaseId++;
+    let released = false;
+    activeLeases = new Map(activeLeases);
+    activeLeases.set(leaseId, { sourceId, acquiredAt: Date.now() });
+
+    const releaseFn = () => {
+      if (released) return; // idempotent
+      released = true;
+      if (activeLeases.has(leaseId)) {
+        activeLeases = new Map(activeLeases);
+        activeLeases.delete(leaseId);
+        activeCount--;
+        decrementSourceActive(sourceId);
+      }
+      tryDispatch();
+    };
+
+    return releaseFn;
+  }
+
   function tryDispatch() {
     while (activeCount < maxConcurrent && totalQueued > 0) {
       const entry = dequeueNext();
       if (!entry) break;
       clearTimeout(entry.timer);
-      activeCount++;
       totalQueued--;
-      metrics = { ...metrics, totalProcessed: metrics.totalProcessed + 1 };
 
-      // Track per-source
-      const srcStats = metrics.perSource[entry.sourceId] || { processed: 0 };
-      metrics = {
-        ...metrics,
-        perSource: {
-          ...metrics.perSource,
-          [entry.sourceId]: { ...srcStats, processed: srcStats.processed + 1 },
-        },
-      };
-
-      const leaseId = nextLeaseId++;
-      let released = false;
-      activeLeases = new Map(activeLeases);
-      activeLeases.set(leaseId, { sourceId: entry.sourceId, acquiredAt: Date.now() });
-
-      entry.resolve(() => {
-        if (released) return; // idempotent — double-release is a no-op
-        released = true;
-        // Guard: if SLOT_LEAK already force-released this lease, skip decrement
-        if (activeLeases.has(leaseId)) {
-          activeLeases = new Map(activeLeases);
-          activeLeases.delete(leaseId);
-          activeCount--;
-        }
-        tryDispatch();
-      });
+      const releaseFn = grantSlot(entry.sourceId);
+      entry.resolve(releaseFn);
     }
   }
 
@@ -128,22 +178,32 @@ export function createFairQueue(options = {}) {
 
     if (activeSources.length === 0) return null;
 
-    rrIndex = rrIndex % activeSources.length;
-    const sourceId = activeSources[rrIndex];
-    rrIndex = (rrIndex + 1) % Math.max(activeSources.length, 1);
+    // Try round-robin, but skip sources that are at their concurrency limit
+    const startIdx = rrIndex % activeSources.length;
+    for (let i = 0; i < activeSources.length; i++) {
+      const idx = (startIdx + i) % activeSources.length;
+      const sourceId = activeSources[idx];
 
-    const queue = sourceQueues.get(sourceId);
-    const entry = queue[0];
-    const rest = queue.slice(1);
+      if (isSourceAtLimit(sourceId)) continue;
 
-    if (rest.length === 0) {
-      sourceQueues.delete(sourceId);
-      sourceOrder = sourceOrder.filter((id) => id !== sourceId);
-    } else {
-      sourceQueues.set(sourceId, rest);
+      rrIndex = (idx + 1) % Math.max(activeSources.length, 1);
+
+      const queue = sourceQueues.get(sourceId);
+      const entry = queue[0];
+      const rest = queue.slice(1);
+
+      if (rest.length === 0) {
+        sourceQueues.delete(sourceId);
+        sourceOrder = sourceOrder.filter((id) => id !== sourceId);
+      } else {
+        sourceQueues.set(sourceId, rest);
+      }
+
+      return { ...entry, sourceId };
     }
 
-    return { ...entry, sourceId };
+    // All queued sources are at their per-source limit
+    return null;
   }
 
   /**
@@ -155,35 +215,28 @@ export function createFairQueue(options = {}) {
    * @returns {Promise<Function>} release function to call when done
    */
   function acquire(sourceId, priority = "normal") {
-    // Fast path: slot available and nothing queued
-    if (activeCount < maxConcurrent && totalQueued === 0) {
-      activeCount++;
-      metrics = { ...metrics, totalProcessed: metrics.totalProcessed + 1 };
-      const srcStats = metrics.perSource[sourceId] || { processed: 0 };
+    // Fast path: global slot available, source not at limit, and nothing queued
+    if (activeCount < maxConcurrent && totalQueued === 0 && !isSourceAtLimit(sourceId)) {
+      const releaseFn = grantSlot(sourceId);
+      return Promise.resolve(releaseFn);
+    }
+
+    // Source at per-source concurrency limit — still enqueue (will dispatch when slot frees)
+    if (isSourceAtLimit(sourceId)) {
+      const limit = getSourceConcurrencyLimit(sourceId);
+      const current = getSourceActiveCount(sourceId);
+      metrics = { ...metrics, totalThrottled: metrics.totalThrottled + 1 };
+      const srcStats = metrics.perSource[sourceId] || { processed: 0, throttled: 0 };
       metrics = {
         ...metrics,
         perSource: {
           ...metrics.perSource,
-          [sourceId]: { ...srcStats, processed: srcStats.processed + 1 },
+          [sourceId]: { ...srcStats, throttled: (srcStats.throttled || 0) + 1 },
         },
       };
-
-      const leaseId = nextLeaseId++;
-      let released = false;
-      activeLeases = new Map(activeLeases);
-      activeLeases.set(leaseId, { sourceId, acquiredAt: Date.now() });
-
-      return Promise.resolve(() => {
-        if (released) return; // idempotent — double-release is a no-op
-        released = true;
-        // Guard: if SLOT_LEAK already force-released this lease, skip decrement
-        if (activeLeases.has(leaseId)) {
-          activeLeases = new Map(activeLeases);
-          activeLeases.delete(leaseId);
-          activeCount--;
-        }
-        tryDispatch();
-      });
+      console.log(
+        `[${new Date().toISOString()}] SOURCE_THROTTLE src=${sourceId} active=${current}/${limit} — queuing`
+      );
     }
 
     // Check total queue limit
@@ -194,7 +247,7 @@ export function createFairQueue(options = {}) {
       );
     }
 
-    // Check per-source limit
+    // Check per-source queue limit
     const sourceQueue = sourceQueues.get(sourceId) || [];
     if (sourceQueue.length >= maxPerSource) {
       metrics = { ...metrics, totalRejected: metrics.totalRejected + 1 };
@@ -256,6 +309,12 @@ export function createFairQueue(options = {}) {
       heldMs: now - lease.acquiredAt,
     }));
 
+    // Per-source active counts
+    const activeBySource = {};
+    for (const [sourceId, count] of activePerSource) {
+      activeBySource[sourceId] = count;
+    }
+
     return {
       active: activeCount,
       maxConcurrent,
@@ -264,7 +323,10 @@ export function createFairQueue(options = {}) {
       maxPerSource,
       queueTimeoutMs,
       maxLeaseMs,
+      maxConcurrentPerSource,
+      defaultMaxConcurrentPerSource,
       queuedPerSource: perSource,
+      activeBySource,
       sourceCount: sourceQueues.size,
       activeLeases: leaseList,
       metrics: { ...metrics },

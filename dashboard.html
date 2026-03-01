@@ -139,6 +139,7 @@
   .event-row .etype.startup,.event-row .etype.complete { color: var(--green); }
   .event-row .etype.error { color: var(--red); }
   .event-row .etype.shutdown,.event-row .etype.slot_leak { color: var(--yellow); }
+  .event-row .etype.system_reap { color: var(--purple); }
   .event-row .tokens { flex-shrink: 0; width: 90px; text-align: right; color: var(--orange); font-size: 10px; }
   .event-row .detail { color: var(--text2); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .empty { color: var(--text2); text-align: center; padding: 16px; font-style: italic; font-size: 12px; }
@@ -161,6 +162,29 @@
   .aff-stats { display: flex; gap: 12px; font-size: 10px; color: var(--text2); margin-top: 4px; }
   .aff-stats span { display: flex; align-items: center; gap: 3px; }
   .aff-stats .aval { font-weight: 600; color: var(--text); }
+
+  /* System Reaper */
+  .reaper-grid { display: grid; grid-template-columns: 1fr 2fr; gap: 12px; }
+  .reaper-stats { display: flex; flex-direction: column; gap: 2px; }
+  .reaper-cats { display: flex; gap: 10px; margin-top: 4px; flex-wrap: wrap; }
+  .reaper-cat-pill { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 500; }
+  .reaper-cat-pill.orphan_shell { background: rgba(248,81,73,0.12); color: var(--red); }
+  .reaper-cat-pill.stuck_proxy_worker { background: rgba(210,136,62,0.12); color: var(--orange); }
+  .reaper-cat-pill.orphan_cli { background: rgba(210,153,34,0.12); color: var(--yellow); }
+  .reaper-cat-pill.orphan_helper { background: rgba(188,140,255,0.12); color: var(--purple); }
+  .reaper-cat-pill .cat-num { font-weight: 700; }
+  .reaper-kills-list { max-height: 200px; overflow-y: auto; }
+  .reaper-kill-row { display: flex; gap: 6px; padding: 2px 0; border-bottom: 1px solid var(--bg3); font-size: 11px; align-items: baseline; }
+  .reaper-kill-row .rk-cat { flex-shrink: 0; width: 110px; font-weight: 500; }
+  .reaper-kill-row .rk-cat.orphan_shell { color: var(--red); }
+  .reaper-kill-row .rk-cat.stuck_proxy_worker { color: var(--orange); }
+  .reaper-kill-row .rk-cat.orphan_cli { color: var(--yellow); }
+  .reaper-kill-row .rk-cat.orphan_helper { color: var(--purple); }
+  .reaper-kill-row .rk-pid { flex-shrink: 0; width: 50px; color: var(--text); font-weight: 600; }
+  .reaper-kill-row .rk-age { flex-shrink: 0; width: 50px; color: var(--text2); }
+  .reaper-kill-row .rk-cmd { color: var(--text2); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .reaper-sweep-btn { background: var(--bg3); border: 1px solid var(--border); border-radius: 4px; color: var(--text2); font-size: 10px; padding: 2px 8px; cursor: pointer; font-family: inherit; margin-left: auto; }
+  .reaper-sweep-btn:hover { color: var(--text); border-color: var(--blue); }
 </style>
 </head>
 <body>
@@ -247,6 +271,12 @@
       <h2>Active Processes</h2>
       <div id="procs-table"><div class="empty">no active processes</div></div>
     </div>
+  </div>
+
+  <!-- System Reaper (full width) -->
+  <div class="card" id="reaper-panel">
+    <h2>&#x1F9DF; System Reaper <span class="section-count" id="reaper-count"></span></h2>
+    <div class="reaper-grid" id="reaper-body"><div class="empty">loading...</div></div>
   </div>
 
   <!-- Event Log (full width) -->
@@ -392,10 +422,11 @@ async function fetchHistory() {
 // ── Main refresh ──
 async function refresh() {
   try {
-    const [metrics, zombies, eventsData] = await Promise.all([
+    const [metrics, zombies, eventsData, reaperData] = await Promise.all([
       fetchJson('/metrics'),
       fetchJson('/zombies'),
       fetchJson('/events?since_id=' + lastEventId + '&limit=100'),
+      fetchJson('/system-reaper').catch(() => ({ stats: null })),
     ]);
 
     // Header
@@ -532,7 +563,19 @@ async function refresh() {
       <div class="metric"><span class="label">timed out</span><span class="value ${qm.totalTimedOut > 0 ? 'yellow' : ''}">${qm.totalTimedOut}</span></div>
       <div class="metric"><span class="label">rejected</span><span class="value ${qm.totalRejected > 0 ? 'red' : ''}">${qm.totalRejected}</span></div>
       <div class="metric"><span class="label">leaked</span><span class="value ${qm.totalLeaked > 0 ? 'yellow' : ''}">${qm.totalLeaked}</span></div>
+      <div class="metric"><span class="label">throttled</span><span class="value ${(qm.totalThrottled || 0) > 0 ? 'yellow' : ''}">${qm.totalThrottled || 0}</span></div>
     `;
+
+    // Per-source active slots
+    const activeBySource = q.activeBySource || {};
+    const srcEntries = Object.entries(activeBySource);
+    if (srcEntries.length > 0) {
+      col1 += `<div class="sub-heading" style="margin-top:6px">Active by Source</div>`;
+      for (const [src, count] of srcEntries.sort((a, b) => b[1] - a[1])) {
+        const srcLabel = src.length > 18 ? src.slice(0, 16) + '…' : src;
+        col1 += `<div class="metric"><span class="label">${srcLabel}</span><span class="value">${count}</span></div>`;
+      }
+    }
 
     col1 += '<hr class="card-divider">';
 
@@ -633,6 +676,16 @@ async function refresh() {
     col3 += `<div class="cfg-row"><span class="cfg-key">queue/source</span><span class="cfg-val">${cfg.maxQueuePerSource ?? '-'}</span></div>`;
     col3 += `<div class="cfg-row"><span class="cfg-key">queue timeout</span><span class="cfg-val">${cfg.queueTimeoutMs ? fmtMs(cfg.queueTimeoutMs) : '-'}</span></div>`;
 
+    // Source concurrency limits
+    const srcLimits = cfg.sourceConcurrencyLimits || {};
+    const srcLimitEntries = Object.entries(srcLimits);
+    if (srcLimitEntries.length > 0 || cfg.defaultSourceConcurrency > 0) {
+      col3 += `<div class="cfg-row"><span class="cfg-key">src default max</span><span class="cfg-val">${cfg.defaultSourceConcurrency || '∞'}</span></div>`;
+      for (const [src, max] of srcLimitEntries) {
+        col3 += `<div class="cfg-row"><span class="cfg-key">src:${src}</span><span class="cfg-val">${max}</span></div>`;
+      }
+    }
+
     col3 += '<hr class="card-divider">';
 
     // Timeouts
@@ -687,6 +740,47 @@ async function refresh() {
       document.getElementById('procs-table').innerHTML = `<table>
         <tr><th>PID</th><th>Mode</th><th>Model</th><th>Tokens</th><th>Age</th><th>Idle</th><th>Source</th><th>Prompt</th><th></th></tr>
         ${rows}</table>`;
+    }
+
+    // ═══ System Reaper ═══
+    const sr = reaperData?.stats || metrics?.systemReaper;
+    if (sr) {
+      const catLabels = { orphan_shell: 'Orphan Shell', stuck_proxy_worker: 'Proxy Worker', orphan_cli: 'Orphan CLI', orphan_helper: 'Orphan Helper' };
+      const lastSweep = sr.lastSweepAt ? fmt(Date.now() - sr.lastSweepAt) + ' ago' : 'never';
+
+      document.getElementById('reaper-count').textContent = sr.totalKilled > 0 ? `${sr.totalKilled} killed` : '';
+
+      let reaperHtml = '<div class="reaper-stats">';
+      reaperHtml += `<div class="metric"><span class="label">sweeps</span><span class="value">${sr.totalSweeps}</span></div>`;
+      reaperHtml += `<div class="metric"><span class="label">total killed</span><span class="value ${sr.totalKilled > 0 ? 'red' : 'green'}">${sr.totalKilled}</span></div>`;
+      reaperHtml += `<div class="metric"><span class="label">last sweep</span><span class="value">${lastSweep}</span></div>`;
+      reaperHtml += '<div class="reaper-cats">';
+      const bc = sr.byCategory || {};
+      for (const [cat, count] of Object.entries(bc)) {
+        reaperHtml += `<span class="reaper-cat-pill ${cat}"><span class="cat-num">${count}</span> ${catLabels[cat] || cat}</span>`;
+      }
+      reaperHtml += '</div></div>';
+
+      // Recent kills list
+      const recent = sr.recentKills || [];
+      if (recent.length > 0) {
+        reaperHtml += '<div class="reaper-kills-list">';
+        reaperHtml += '<div class="sub-heading">Recent Kills</div>';
+        for (const k of [...recent].reverse().slice(0, 30)) {
+          const ageStr = k.ageSec >= 3600 ? Math.round(k.ageSec / 3600) + 'h' : k.ageSec >= 60 ? Math.round(k.ageSec / 60) + 'm' : k.ageSec + 's';
+          reaperHtml += `<div class="reaper-kill-row">
+            <span class="rk-cat ${k.category}">${catLabels[k.category] || k.category}</span>
+            <span class="rk-pid">${k.pid}</span>
+            <span class="rk-age">${ageStr}</span>
+            <span class="rk-cmd" title="${(k.command || '').replace(/"/g, '&quot;')}">${(k.command || '').slice(0, 80)}</span>
+          </div>`;
+        }
+        reaperHtml += '</div>';
+      } else {
+        reaperHtml += '<div style="display:flex;align-items:center;justify-content:center"><div class="empty">no kills yet — system is clean</div></div>';
+      }
+
+      document.getElementById('reaper-body').innerHTML = reaperHtml;
     }
 
     // ═══ Events ═══
@@ -784,6 +878,26 @@ function initSSE() {
       if (el) { el.style.opacity = '0.4'; }
     }, 30000);
     activeStreams.delete(d.reqId);
+  });
+
+  es.addEventListener('system_reap', (e) => {
+    const d = JSON.parse(e.data);
+    const catLabels = { orphan_shell: 'Orphan Shell', stuck_proxy_worker: 'Proxy Worker', orphan_cli: 'Orphan CLI', orphan_helper: 'Orphan Helper' };
+    const feeds = document.getElementById('stream-feeds');
+    const placeholder = feeds.querySelector('.empty');
+    if (placeholder) placeholder.remove();
+
+    const item = document.createElement('div');
+    item.className = 'stream-item';
+    item.innerHTML = `
+      <div class="stream-item-header">
+        <span style="color:var(--red)">&#x1F9DF;</span>
+        <span style="color:var(--red);font-weight:600">SYSTEM REAP</span>
+        <span class="sid">${catLabels[d.category] || d.category}</span>
+      </div>
+      <div class="stream-item-body" style="color:var(--red)">Killed PID ${d.pid} (age: ${d.ageSec}s)</div>`;
+    feeds.prepend(item);
+    while (feeds.children.length > 5) feeds.removeChild(feeds.lastChild);
   });
 
   es.onerror = () => {

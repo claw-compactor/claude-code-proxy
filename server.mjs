@@ -34,6 +34,7 @@ import { createMetricsStore } from "./metrics-store.mjs";
 import { createRateLimiter } from "./rate-limiter.mjs";
 import { createRedisClient } from "./redis-client.mjs";
 import { createSessionAffinity } from "./session-affinity.mjs";
+import { createSystemReaper } from "./system-reaper.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -435,12 +436,26 @@ try {
   redis = null;
 }
 
+// Per-source concurrency limits (env: SOURCE_CONCURRENCY_LIMITS="batch-labeler:15,cron:5")
+const SOURCE_CONCURRENCY_LIMITS = (() => {
+  const raw = process.env.SOURCE_CONCURRENCY_LIMITS || "";
+  const limits = {};
+  for (const part of raw.split(",").filter(Boolean)) {
+    const [src, max] = part.split(":");
+    if (src && max) limits[src.trim()] = parseInt(max.trim(), 10);
+  }
+  return limits;
+})();
+const DEFAULT_SOURCE_CONCURRENCY = parseInt(process.env.DEFAULT_SOURCE_CONCURRENCY || "0", 10);
+
 const queue = createFairQueue({
   maxConcurrent: MAX_CONCURRENT,
   maxPerSource: MAX_QUEUE_PER_SOURCE,
   maxTotal: MAX_QUEUE_TOTAL,
   queueTimeoutMs: QUEUE_TIMEOUT_MS,
   maxLeaseMs: STREAM_TIMEOUT_MS + 60_000, // stream timeout + 1 min grace
+  maxConcurrentPerSource: SOURCE_CONCURRENCY_LIMITS,
+  defaultMaxConcurrentPerSource: DEFAULT_SOURCE_CONCURRENCY,
 });
 
 const rateLimiter = createRateLimiter({ limits: RATE_LIMITS, redis });
@@ -462,6 +477,15 @@ const tokenTracker = createTokenTracker({ redis });
 
 // Metrics store: persistent time-series data for dashboard charts
 const metricsStore = createMetricsStore({ redis });
+
+// System reaper: periodic cleanup of orphan OS processes
+const systemReaper = createSystemReaper({
+  intervalMs: parseInt(process.env.SYSTEM_REAPER_INTERVAL_MS || "300000", 10),
+  shellMaxAgeSec: parseInt(process.env.SYSTEM_REAPER_SHELL_MAX_AGE || "1800", 10),
+  proxyIdleThresholdSec: parseInt(process.env.SYSTEM_REAPER_PROXY_IDLE || "600", 10),
+  cliMinAgeSec: parseInt(process.env.SYSTEM_REAPER_CLI_MIN_AGE || "300", 10),
+  helperMinAgeSec: parseInt(process.env.SYSTEM_REAPER_HELPER_MIN_AGE || "1800", 10),
+});
 
 // Session affinity: sticky routing for conversation sessions
 const sessionAffinity = createSessionAffinity({ ttlMs: 5 * 60 * 1000 }); // 5 min — short TTL for better distribution
@@ -487,6 +511,27 @@ registry.onReap((zombie) => {
     idleSec: idleS,
   });
 });
+
+// Wire system reaper events into event log + SSE
+systemReaper.onReap((result) => {
+  eventLog.push("system_reap", {
+    category: result.category,
+    pid: result.pid,
+    ppid: result.ppid,
+    ageSec: result.ageSec,
+    command: result.command,
+    killed: result.killed,
+  });
+  sseBroadcast("system_reap", {
+    category: result.category,
+    pid: result.pid,
+    ageSec: result.ageSec,
+    killed: result.killed,
+  });
+});
+
+// Start the system reaper periodic sweep
+systemReaper.start();
 
 // ============================================================
 // SSE Broadcast — real-time stream to dashboard subscribers
@@ -521,6 +566,7 @@ function gatherMetricsSnapshot() {
     liveTokens: rs.liveTokens,
     events: counts,
     sessionAffinity: sessionAffinity.getStats(),
+    systemReaper: systemReaper.getStats(),
   };
 }
 
@@ -1848,7 +1894,7 @@ function handleHealth(req, res) {
     redis: redis ? { connected: redis.isReady() } : { connected: false },
     cliRouters: workers,
     primaryRouter: PRIMARY_WORKER,
-    queue: { active: qs.active, queued: qs.totalQueued, max: qs.maxConcurrent, sources: qs.sourceCount },
+    queue: { active: qs.active, queued: qs.totalQueued, max: qs.maxConcurrent, sources: qs.sourceCount, activeBySource: qs.activeBySource },
     processes: { tracked: rs.total, byMode: rs.byMode, liveTokens: rs.liveTokens },
     tokens: tokenTracker.getTotals(),
     sessionAffinity: sessionAffinity.getStats(),
@@ -1879,6 +1925,8 @@ function handleMetrics(req, res) {
       maxConcurrent: MAX_CONCURRENT,
       maxQueueTotal: MAX_QUEUE_TOTAL,
       maxQueuePerSource: MAX_QUEUE_PER_SOURCE,
+      sourceConcurrencyLimits: SOURCE_CONCURRENCY_LIMITS,
+      defaultSourceConcurrency: DEFAULT_SOURCE_CONCURRENCY,
       queueTimeoutMs: QUEUE_TIMEOUT_MS,
       heartbeatByModel: HEARTBEAT_BY_MODEL,
       defaultHeartbeatMs: DEFAULT_HEARTBEAT_MS,
@@ -1895,7 +1943,21 @@ function handleMetrics(req, res) {
     sessionAffinity: sessionAffinity.getStats(),
     workerStats,
     activeConnections: Object.fromEntries(_activeConns),
+    systemReaper: systemReaper.getStats(),
   });
+}
+
+function handleSystemReaper(req, res) {
+  const stats = systemReaper.getStats();
+  sendJson(res, 200, {
+    stats,
+    config: systemReaper.config,
+  });
+}
+
+async function handleSystemReaperSweep(req, res) {
+  const result = systemReaper.sweep();
+  sendJson(res, 200, { result });
 }
 
 function handleZombies(req, res) {
@@ -2020,7 +2082,7 @@ const server = createServer(async (req, res) => {
   }
 
   // Auth check (skip for health, dashboard, events)
-  const noAuthPaths = ["/health", "/dashboard", "/dashboard/", "/dashboard/proxy", "/dashboard/proxy/", "/events", "/metrics/history", "/stream"];
+  const noAuthPaths = ["/health", "/dashboard", "/dashboard/", "/dashboard/proxy", "/dashboard/proxy/", "/events", "/metrics/history", "/stream", "/system-reaper"];
   if (!noAuthPaths.includes(url.pathname) && !authenticate(req)) {
     return sendJson(res, 401, { error: { message: "Unauthorized" } });
   }
@@ -2040,6 +2102,10 @@ const server = createServer(async (req, res) => {
       handleZombies(req, res);
     } else if (url.pathname === "/zombies" && req.method === "POST") {
       await handleKillZombie(req, res);
+    } else if (url.pathname === "/system-reaper" && req.method === "GET") {
+      handleSystemReaper(req, res);
+    } else if (url.pathname === "/system-reaper" && req.method === "POST") {
+      await handleSystemReaperSweep(req, res);
     } else if (url.pathname === "/events" && req.method === "GET") {
       handleEvents(req, res, url);
     } else if (url.pathname === "/metrics/history" && req.method === "GET") {
@@ -2076,6 +2142,7 @@ function shutdown(signal) {
   registry.destroy();
   queue.destroy();
   metricsStore.destroy();
+  systemReaper.destroy();
   sessionAffinity.shutdown();
 
   // Close Redis connection
@@ -2128,6 +2195,10 @@ server.listen(PORT, "0.0.0.0", async () => {
   console.log(`Models: ${Object.keys(MODEL_MAP).join(", ")}`);
   console.log(`Rate limits: sonnet ${RATE_LIMITS.sonnet.requestsPerMin}/min, opus ${RATE_LIMITS.opus.requestsPerMin}/min, haiku ${RATE_LIMITS.haiku.requestsPerMin}/min`);
   console.log(`Reaper: age=${MAX_PROCESS_AGE_MS}ms idle=${MAX_IDLE_MS}ms interval=${REAPER_INTERVAL_MS}ms`);
+  const srcLimits = Object.keys(SOURCE_CONCURRENCY_LIMITS).length > 0
+    ? Object.entries(SOURCE_CONCURRENCY_LIMITS).map(([k, v]) => `${k}:${v}`).join(", ")
+    : "none";
+  console.log(`Source concurrency limits: ${srcLimits} (default=${DEFAULT_SOURCE_CONCURRENCY || "unlimited"})`);
   console.log(`Timeouts: sync=${SYNC_TIMEOUT_MS}ms stream=${STREAM_TIMEOUT_MS}ms`);
   console.log(`Heartbeat: opus=${HEARTBEAT_BY_MODEL.opus}ms sonnet=${HEARTBEAT_BY_MODEL.sonnet}ms haiku=${HEARTBEAT_BY_MODEL.haiku}ms`);
   console.log(`Metrics store: ${metricsStore.getBufferSize()} historical snapshots loaded`);
