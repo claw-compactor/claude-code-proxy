@@ -3,8 +3,14 @@
  *
  * Priority (highest → lowest):
  *   1. Environment variable override (for debugging only)
- *   2. proxy.config.json file values
- *   3. Hardcoded defaults (last resort)
+ *   2. openclaw.json shared values (model aliases, fallback config)
+ *   3. proxy.config.json file values (proxy-specific: workers, queue, rate limits)
+ *   4. Hardcoded defaults (last resort)
+ *
+ * Shared values from openclaw.json (single source of truth):
+ *   - Model alias → Anthropic model ID mapping
+ *   - Fallback API config (minimax-local)
+ *   - Proxy auth token (provider apiKey)
  *
  * Usage:
  *   import { loadConfig } from "./config-loader.mjs";
@@ -17,6 +23,8 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(__dirname, "proxy.config.json");
+const OPENCLAW_HOME = join(process.env.HOME || "", ".openclaw");
+const OPENCLAW_JSON = join(OPENCLAW_HOME, "openclaw.json");
 
 /**
  * Read a nested path from an object.
@@ -51,6 +59,47 @@ const toBool = (v) => v === "true" || v === "1";
 const toJSON = (v) => JSON.parse(v);
 
 /**
+ * Load shared config from ~/.openclaw/openclaw.json.
+ * Returns parsed object or empty object if unavailable.
+ * This is the gateway's authoritative config — we only read shared values.
+ */
+function loadOpenclawConfig() {
+  try {
+    const raw = readFileSync(OPENCLAW_JSON, "utf-8");
+    const parsed = JSON.parse(raw);
+    console.log(`[Config] Loaded shared config: ${OPENCLAW_JSON}`);
+    return parsed;
+  } catch (err) {
+    console.warn(
+      `[Config] openclaw.json not available (${err.code || err.message}), ` +
+      `using proxy.config.json only`
+    );
+    return {};
+  }
+}
+
+/**
+ * Extract the minimax-local (or other) fallback provider from openclaw.json.
+ * Looks for any provider that is NOT "claude-code".
+ */
+function extractFallbackFromOpenclaw(oc) {
+  const providers = get(oc, "models.providers") || {};
+  for (const [name, provider] of Object.entries(providers)) {
+    if (name === "claude-code") continue;
+    const firstModel = (provider.models || [])[0];
+    if (provider.baseUrl && firstModel) {
+      return {
+        baseUrl: provider.baseUrl,
+        apiKey: provider.apiKey || "none",
+        model: firstModel.id,
+        name,
+      };
+    }
+  }
+  return null;
+}
+
+/**
  * Parse SOURCE_CONCURRENCY_LIMITS from "key:val,key:val" string format.
  */
 function parseSourceLimits(raw) {
@@ -60,6 +109,57 @@ function parseSourceLimits(raw) {
     if (src && max) limits[src.trim()] = parseInt(max.trim(), 10);
   }
   return limits;
+}
+
+/**
+ * Validate that proxy config and openclaw.json agree on shared values.
+ * Logs warnings (non-fatal) for any drift detected.
+ */
+function validateCrossConfig(oc, proxyFile, resolved) {
+  if (!oc || Object.keys(oc).length === 0) return;
+
+  const warnings = [];
+
+  // Check: proxy authToken matches openclaw provider apiKey
+  const ocApiKey = get(oc, "models.providers.claude-code.apiKey");
+  if (ocApiKey && resolved.authToken !== ocApiKey) {
+    warnings.push(
+      `AUTH_DRIFT: openclaw.json apiKey="${ocApiKey}" ≠ proxy authToken="${resolved.authToken}"`
+    );
+  }
+
+  // Check: proxy port matches openclaw provider baseUrl
+  const ocBaseUrl = get(oc, "models.providers.claude-code.baseUrl") || "";
+  const portMatch = ocBaseUrl.match(/:(\d+)/);
+  if (portMatch && parseInt(portMatch[1], 10) !== resolved.port) {
+    warnings.push(
+      `PORT_DRIFT: openclaw.json baseUrl port=${portMatch[1]} ≠ proxy port=${resolved.port}`
+    );
+  }
+
+  // Check: cron model references exist in openclaw allowlist
+  try {
+    const cronPath = join(OPENCLAW_HOME, "cron", "jobs.json");
+    const cronData = JSON.parse(readFileSync(cronPath, "utf-8"));
+    const allowlist = Object.keys(get(oc, "agents.defaults.models") || {});
+    for (const job of (cronData.jobs || [])) {
+      const model = get(job, "payload.model");
+      if (model && allowlist.length > 0 && !allowlist.includes(model)) {
+        warnings.push(
+          `CRON_MODEL_MISSING: job "${job.name}" model="${model}" not in allowlist [${allowlist.join(", ")}]`
+        );
+      }
+    }
+  } catch {
+    // cron/jobs.json may not exist — that's fine
+  }
+
+  if (warnings.length > 0) {
+    console.warn(`[Config] ⚠️  Cross-config drift detected:`);
+    for (const w of warnings) console.warn(`  - ${w}`);
+  } else {
+    console.log(`[Config] ✅ Cross-config validation OK`);
+  }
 }
 
 /**
@@ -83,11 +183,16 @@ export function loadConfig() {
     process.exit(78);
   }
 
+  // --- Load shared config from openclaw.json ---
+  const oc = loadOpenclawConfig();
+
   // --- Resolve all values with env override support ---
 
   const workers = resolve(file, "workers", "WORKERS", [], toJSON);
   const port = resolve(file, "server.port", "CLAUDE_PROXY_PORT", 8403, toInt);
-  const authToken = resolve(file, "server.authToken", "PROXY_AUTH_TOKEN", "local-proxy");
+  // Auth token: openclaw.json provider apiKey is authoritative
+  const ocAuthToken = get(oc, "models.providers.claude-code.apiKey");
+  const authToken = resolve(file, "server.authToken", "PROXY_AUTH_TOKEN", ocAuthToken || "local-proxy");
 
   const primaryWorker = resolve(file, "routing.primaryWorker", "PRIMARY_WORKER", "1");
   const useCliAgents = resolve(file, "routing.useCliAgents", "USE_CLI_AGENTS", true, toBool);
@@ -129,13 +234,15 @@ export function loadConfig() {
 
   const anthropicApiBase = resolve(file, "anthropic.apiBase", "ANTHROPIC_API_BASE", "https://api.anthropic.com");
   const anthropicApiVersion = resolve(file, "anthropic.apiVersion", "ANTHROPIC_API_VERSION", "2023-06-01");
+  // Model IDs: proxy.config.json is authoritative for Anthropic model IDs.
+  // These are the actual Anthropic API model strings (e.g., "claude-sonnet-4-6").
   const anthropicModels = {
     sonnet: resolve(file, "anthropic.models.sonnet", "ANTHROPIC_SONNET_MODEL", "claude-sonnet-4-6"),
     opus: resolve(file, "anthropic.models.opus", "ANTHROPIC_OPUS_MODEL", "claude-opus-4-6"),
     haiku: resolve(file, "anthropic.models.haiku", "ANTHROPIC_HAIKU_MODEL", "claude-haiku-4-5-20251001"),
   };
 
-  // Fallback API
+  // Fallback API: openclaw.json provider definitions are authoritative
   let fallback;
   if (process.env.FALLBACK_API_URL) {
     fallback = {
@@ -145,7 +252,8 @@ export function loadConfig() {
       name: process.env.FALLBACK_NAME || "fallback",
     };
   } else {
-    fallback = get(file, "fallback") || {
+    const ocFallback = extractFallbackFromOpenclaw(oc);
+    fallback = get(file, "fallback") || ocFallback || {
       baseUrl: "http://172.28.216.81:8080/v1",
       apiKey: "none",
       model: "MiniMax-M2.5-Q8_0-00001-of-00006.gguf",
@@ -211,6 +319,9 @@ export function loadConfig() {
     ...w,
     name: w.name || String(i + 1),
   }));
+
+  // --- Cross-config drift validation ---
+  validateCrossConfig(oc, file, { port, authToken });
 
   const config = {
     server: { port, authToken },

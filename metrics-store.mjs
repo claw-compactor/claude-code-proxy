@@ -226,6 +226,7 @@ export function createMetricsStore(options = {}) {
         o: data.liveTokens?.output || 0,
         t: data.liveTokens?.total || 0,
       },
+      err: buildErrorSnapshot(data.errorsByCategory || {}),
     });
 
     buffer =
@@ -248,6 +249,14 @@ export function createMetricsStore(options = {}) {
         o: data.output || 0,
         r: data.requests || 0,
       };
+    }
+    return Object.freeze(out);
+  }
+
+  function buildErrorSnapshot(byCategory) {
+    const out = {};
+    for (const [cat, count] of Object.entries(byCategory)) {
+      if (count > 0) out[cat] = count;
     }
     return Object.freeze(out);
   }
@@ -320,6 +329,7 @@ export function createMetricsStore(options = {}) {
           liveI: last.live?.i || 0,
           liveO: last.live?.o || 0,
           liveT: last.live?.t || 0,
+          errCats: last.err || {},
           samples: pts.length,
         })
       );
@@ -344,6 +354,7 @@ export function createMetricsStore(options = {}) {
       liveI: p.live?.i || 0,
       liveO: p.live?.o || 0,
       liveT: p.live?.t || 0,
+      errCats: p.err || {},
       samples: 1,
     });
   }

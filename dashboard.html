@@ -56,7 +56,8 @@
   .main { padding: 12px 20px; display: flex; flex-direction: column; gap: 12px; }
 
   /* Chart section */
-  .chart-section { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .chart-section { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  @media (max-width: 1200px) { .chart-section { grid-template-columns: 1fr 1fr; } }
   .chart-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
   .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
   .chart-header h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text2); }
@@ -238,6 +239,18 @@
       </div>
       <div class="chart-wrap"><canvas id="req-chart"></canvas></div>
     </div>
+    <div class="chart-card">
+      <div class="chart-header">
+        <h2>Error Trend</h2>
+        <div class="tab-group" id="chart-tabs-3">
+          <button class="tab-btn active" data-w="1h">1H</button>
+          <button class="tab-btn" data-w="6h">6H</button>
+          <button class="tab-btn" data-w="1d">1D</button>
+          <button class="tab-btn" data-w="7d">7D</button>
+        </div>
+      </div>
+      <div class="chart-wrap"><canvas id="err-chart"></canvas></div>
+    </div>
   </div>
 
   <!-- ═══ OPERATIONS HUB — 3 columns ═══ -->
@@ -293,6 +306,7 @@ let startTime = Date.now();
 let currentWindow = '1h';
 let tokChart = null;
 let reqChart = null;
+let errChart = null;
 let historyData = null;
 
 // ── Helpers ──
@@ -369,10 +383,29 @@ function initCharts() {
       datasets: [
         { label: 'Completed', data: [], borderColor: '#3fb950', backgroundColor: 'rgba(63,185,80,0.1)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 0 },
         { label: 'Active', data: [], borderColor: '#58a6ff', tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
-        { label: 'Errors', data: [], borderColor: '#f85149', tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
       ],
     },
     options: { ...chartDefaults },
+  });
+
+  const errCtx = document.getElementById('err-chart').getContext('2d');
+  errChart = new Chart(errCtx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { label: 'Total', data: [], borderColor: '#f85149', backgroundColor: 'rgba(248,81,73,0.08)', fill: true, tension: 0.3, borderWidth: 2, pointRadius: 0 },
+        { label: 'CLI Crash', data: [], borderColor: '#ff7b72', borderDash: [4,2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
+        { label: 'Timeout', data: [], borderColor: '#d29922', borderDash: [4,2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
+        { label: 'API Error', data: [], borderColor: '#bc8cff', borderDash: [4,2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
+        { label: 'Stream Retry', data: [], borderColor: '#58a6ff', borderDash: [4,2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
+        { label: 'Other', data: [], borderColor: '#8b949e', borderDash: [4,2], tension: 0.3, borderWidth: 1.5, pointRadius: 0 },
+      ],
+    },
+    options: { ...chartDefaults, scales: {
+      ...chartDefaults.scales,
+      y: { ...chartDefaults.scales.y, ticks: { ...chartDefaults.scales.y.ticks, callback: v => String(v) } },
+    }},
   });
 }
 
@@ -386,6 +419,15 @@ function updateCharts(points) {
       return d >= 0 ? d : 0;
     });
   }
+  function catDeltas(points, cat) {
+    return points.map((p, i) => {
+      if (i === 0) return 0;
+      const cur = (p.errCats || {})[cat] || 0;
+      const prev = (points[i - 1].errCats || {})[cat] || 0;
+      const d = cur - prev;
+      return d >= 0 ? d : 0;
+    });
+  }
   tokChart.data.labels = labels;
   tokChart.data.datasets[0].data = deltas(points.map(p => p.tokT));
   tokChart.data.datasets[1].data = deltas(points.map(p => p.tokI));
@@ -395,13 +437,32 @@ function updateCharts(points) {
   reqChart.data.labels = labels;
   reqChart.data.datasets[0].data = deltas(points.map(p => p.reqCompleted));
   reqChart.data.datasets[1].data = points.map(p => p.reqActive);
-  reqChart.data.datasets[2].data = points.map(p => p.reqErrors);
   reqChart.update('none');
+
+  if (errChart) {
+    errChart.data.labels = labels;
+    // Total errors (delta, not cumulative)
+    errChart.data.datasets[0].data = deltas(points.map(p => p.reqErrors));
+    // Per-category breakdown
+    errChart.data.datasets[1].data = catDeltas(points, 'cli_crash');
+    errChart.data.datasets[2].data = catDeltas(points, 'timeout');
+    errChart.data.datasets[3].data = catDeltas(points, 'api_error');
+    errChart.data.datasets[4].data = catDeltas(points, 'stream_retry');
+    const otherCats = ['cli_killed', 'context_overflow', 'queue_timeout', 'safety_refusal', 'other'];
+    errChart.data.datasets[5].data = points.map((p, i) => {
+      if (i === 0) return 0;
+      let cur = 0, prev = 0;
+      for (const c of otherCats) { cur += (p.errCats || {})[c] || 0; prev += (points[i - 1].errCats || {})[c] || 0; }
+      const d = cur - prev;
+      return d >= 0 ? d : 0;
+    });
+    errChart.update('none');
+  }
 }
 
 // ── Tab click handlers ──
 function setupTabs() {
-  for (const group of ['chart-tabs', 'chart-tabs-2']) {
+  for (const group of ['chart-tabs', 'chart-tabs-2', 'chart-tabs-3']) {
     document.getElementById(group).addEventListener('click', (e) => {
       const btn = e.target.closest('.tab-btn');
       if (!btn) return;
@@ -597,10 +658,42 @@ async function refresh() {
     // ═══ COLUMN 2: Health & Errors ═══
     let col2 = '';
 
-    // Rate Limits
+    // Max Plan Unified Rate Limits (from Anthropic response headers)
+    const unified = metrics.unifiedRateLimits || {};
+    const unifiedEntries = Object.entries(unified);
+    if (unifiedEntries.length > 0) {
+      col2 += `<div class="sub-heading">Max Plan · Unified Limits</div>`;
+      for (const [tokenName, u] of unifiedEntries) {
+        const d7Pct = Math.round((u.d7Utilization || 0) * 100);
+        const h5Pct = Math.round((u.h5Utilization || 0) * 100);
+        const fbPct = Math.round((u.fallbackPct || 1) * 100);
+        const d7Color = d7Pct > 80 ? 'var(--red)' : d7Pct > 50 ? 'var(--yellow)' : 'var(--green)';
+        const h5Color = h5Pct > 80 ? 'var(--red)' : h5Pct > 50 ? 'var(--yellow)' : 'var(--green)';
+        const fbColor = fbPct < 80 ? 'var(--red)' : fbPct < 100 ? 'var(--yellow)' : 'var(--green)';
+        const statusIcon = u.status === 'allowed' ? '🟢' : u.status === 'allowed_warning' ? '🟡' : '🔴';
+        const orgShort = u.orgId ? '…' + u.orgId.slice(-6) : '-';
+        const agoMs = u.updatedAt ? Date.now() - u.updatedAt : 0;
+        const agoStr = agoMs > 0 ? fmt(agoMs) + ' ago' : '-';
+        col2 += `<div style="margin-bottom:6px;padding:6px 8px;background:var(--bg);border-radius:4px;border:1px solid var(--bg3)">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+            <span style="font-weight:600;color:var(--blue);font-size:11px">${statusIcon} W${tokenName}</span>
+            <span style="font-size:9px;color:var(--text2)">org ${orgShort} · ${agoStr}</span>
+          </div>
+          <div class="metric"><span class="label">7d usage</span><span class="value" style="color:${d7Color}">${d7Pct}%</span></div>
+          <div class="bar-wrap"><div class="bar-bg"><div class="bar-fill" style="width:${d7Pct}%;background:${d7Color}"></div></div></div>
+          <div class="metric"><span class="label">5h usage</span><span class="value" style="color:${h5Color}">${h5Pct}%</span></div>
+          <div class="bar-wrap"><div class="bar-bg"><div class="bar-fill" style="width:${h5Pct}%;background:${h5Color}"></div></div></div>
+          <div class="metric"><span class="label">capacity</span><span class="value" style="color:${fbColor}">${fbPct}%</span></div>
+          ${u.overageStatus ? `<div class="metric"><span class="label">overage</span><span class="value" style="color:${u.overageStatus === 'rejected' ? 'var(--red)' : 'var(--text2)'}">${u.overageStatus}</span></div>` : ''}
+        </div>`;
+      }
+      col2 += '<hr class="card-divider">';
+    }
+
+    // Local Rate Limits (proxy-internal per-model)
     const ru = metrics.rateUsage;
     const rl = metrics.rateLimits;
-    col2 += `<div class="sub-heading">Rate Limits</div>`;
+    col2 += `<div class="sub-heading">Rate Limits · Per Model</div>`;
     let hasRates = false;
     for (const model of ['opus', 'sonnet', 'haiku']) {
       const u = ru[model];
@@ -729,8 +822,10 @@ async function refresh() {
         const tokCell = liveTotal > 0
           ? `<span style="color:var(--orange)">${fmtTok(li)}\u2192${fmtTok(lo)}</span> <span style="color:var(--text2);font-size:10px">(${fmtTok(liveTotal)})</span>`
           : '<span style="color:var(--text2)">-</span>';
+        const wName = p.worker ? p.worker.split(':')[0] : '-';
+        const wTag = p.worker ? `<span style="display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(88,166,255,0.15);color:var(--blue)">W${wName}</span>` : '<span style="color:var(--text2)">-</span>';
         return `<tr${isZombie ? ' style="background:rgba(248,81,73,0.1)"' : ''}>
-          <td>${p.pid}</td><td>${modeTag(p.mode)}</td><td>${modelTag(p.model)}</td>
+          <td>${p.pid}</td><td>${wTag}</td><td>${modeTag(p.mode)}</td><td>${modelTag(p.model)}</td>
           <td>${tokCell}</td><td>${age}</td><td>${idle}</td>
           <td title="${p.source}">${p.source.length > 16 ? '\u2026' + p.source.slice(-14) : p.source}</td>
           <td title="${p.promptPreview}">${(p.promptPreview || '').slice(0, 24)}\u2026</td>
@@ -738,7 +833,7 @@ async function refresh() {
         </tr>`;
       }).join('');
       document.getElementById('procs-table').innerHTML = `<table>
-        <tr><th>PID</th><th>Mode</th><th>Model</th><th>Tokens</th><th>Age</th><th>Idle</th><th>Source</th><th>Prompt</th><th></th></tr>
+        <tr><th>PID</th><th>Worker</th><th>Mode</th><th>Model</th><th>Tokens</th><th>Age</th><th>Idle</th><th>Source</th><th>Prompt</th><th></th></tr>
         ${rows}</table>`;
     }
 
@@ -825,23 +920,28 @@ function initSSE() {
 
   es.addEventListener('request', (e) => {
     const d = JSON.parse(e.data);
-    if (d.mode !== 'stream') return;
+    // Show both CLI stream and API Direct (stream_tools/sync_tools) modes
+    const isStream = d.mode === 'stream' || d.mode === 'stream_tools';
+    const isSync = d.mode === 'sync_tools';
+    if (!isStream && !isSync) return;
     const feeds = document.getElementById('stream-feeds');
     const placeholder = feeds.querySelector('.empty');
     if (placeholder) placeholder.remove();
 
+    const displayMode = isSync ? 'sync' : 'stream';
     const item = document.createElement('div');
     item.className = 'stream-item';
     item.id = 'stream-' + d.reqId;
+    const wBadge = d.worker ? `<span style="display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(88,166,255,0.15);color:var(--blue)">W${d.worker}</span>` : '';
     item.innerHTML = `
       <div class="stream-item-header">
-        ${modelTag(d.model)} ${modeTag('stream')}
+        ${wBadge} ${modelTag(d.model)} ${modeTag(displayMode)}
         <span class="sid">${d.reqId.slice(-8)}</span>
-        <span class="stok" id="stok-${d.reqId}">0 chars</span>
+        <span class="stok" id="stok-${d.reqId}">${isSync ? 'waiting...' : '0 chars'}</span>
       </div>
-      <div class="stream-item-body" id="sbody-${d.reqId}"><span class="cursor"></span></div>`;
+      <div class="stream-item-body" id="sbody-${d.reqId}">${isSync ? '<span style="color:var(--fg-dim)">sync request in progress...</span>' : '<span class="cursor"></span>'}</div>`;
     feeds.prepend(item);
-    activeStreams.set(d.reqId, { el: item, text: '' });
+    activeStreams.set(d.reqId, { el: item, text: '', isSync });
     while (feeds.children.length > 5) feeds.removeChild(feeds.lastChild);
   });
 
@@ -871,7 +971,8 @@ function initSSE() {
     }
     const tokEl = document.getElementById('stok-' + d.reqId);
     if (tokEl) {
-      tokEl.innerHTML = `<span style="color:var(--green)">\u2713</span> ${fmtTok(d.inputTokens)} in \u2192 ${fmtTok(d.outputTokens)} out`;
+      const wLabel = d.worker ? ` \u00b7 W${d.worker}` : '';
+      tokEl.innerHTML = `<span style="color:var(--green)">\u2713</span> ${fmtTok(d.inputTokens)} in \u2192 ${fmtTok(d.outputTokens)} out${wLabel}`;
     }
     setTimeout(() => {
       const el = document.getElementById('stream-' + d.reqId);

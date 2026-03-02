@@ -261,12 +261,21 @@ function reapOrphanCli(allProcs, config) {
   }
 
   // 3b. Orphan pipe helpers: python -c json, python -m json.tool, head, tail, ssh clawdbot
+  // NOTE: autossh is a persistent tunnel managed by launchd — NEVER kill it
   const helperProcs = allProcs.filter((p) => {
     if (p.ppid !== 1) return false;
     if (p.ageSec < config.helperMinAgeSec) return false;
     if (p.pid === selfPid) return false;
 
     const cmd = p.command;
+
+    // Never kill autossh (persistent tunnel managed by launchd)
+    if (cmd.includes("autossh")) return false;
+
+    // Never kill SSH tunnel processes (port forwarding: -R, -L, -D flags)
+    // autossh spawns child SSH with these flags — killing them breaks the tunnel
+    if (cmd.includes("ssh") && (cmd.includes(" -R ") || cmd.includes(" -L ") || cmd.includes(" -D "))) return false;
+
     return (
       (cmd.includes("python") && cmd.includes("-c") && cmd.includes("json")) ||
       (cmd.includes("python") && cmd.includes("-m json.tool")) ||

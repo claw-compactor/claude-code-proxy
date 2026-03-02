@@ -7,3 +7,8 @@ task-tracker.json
 __pycache__/
 *.pyc
 .env*
+proxy.config.json
+proxy.config.json.tmp
+proxy.config.json.bak.*
+token_labels.json
+shutdown_aimm_bots.sh

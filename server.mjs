@@ -67,9 +67,9 @@ const USE_CLI_AGENTS = CONFIG.routing.useCliAgents;
 const _workerPool = CONFIG.workers;
 
 // Worker health state
-const _workerHealth = new Map(); // name -> { limited: boolean, limitedAt: number }
+const _workerHealth = new Map(); // name -> { limited: boolean, limitedAt: number, limitedUntil: number }
 for (const w of _workerPool) {
-  _workerHealth.set(w.name, { limited: false, limitedAt: 0 });
+  _workerHealth.set(w.name, { limited: false, limitedAt: 0, limitedUntil: 0 });
 }
 
 // Round-robin index for load-balancing mode
@@ -84,6 +84,7 @@ console.log(`[CLIRouter] Primary: ${PRIMARY_WORKER} | Health check: ${HEALTH_CHE
 // ============================================================
 
 const FALLBACK_API = CONFIG.fallback;
+const FALLBACK_TIMEOUT_MS = 15_000;
 console.log(`[Fallback] ${FALLBACK_API.name} → ${FALLBACK_API.baseUrl} model=${FALLBACK_API.model}`);
 
 // ============================================================
@@ -124,6 +125,54 @@ function getNextToken() {
   const idx = _tokenRrIndex++ % TOKEN_POOL.length;
   return TOKEN_POOL[idx];
 }
+
+// Token cooldowns for Anthropic API direct (per OAuth token)
+const _tokenCooldowns = new Map(); // name -> unix ms
+function setTokenCooldown(tokenEntry, ms, reason) {
+  const until = Date.now() + ms;
+  _tokenCooldowns.set(tokenEntry.name, until);
+  console.log(`[${ts()}] TOKEN_COOLDOWN_SET token=${tokenEntry.name} ms=${ms} reason=${reason || ""}`);
+}
+function getTokenCooldownMs(tokenEntry) {
+  const until = _tokenCooldowns.get(tokenEntry.name) || 0;
+  return Math.max(0, until - Date.now());
+}
+async function waitForTokenCooldown(tokenEntry) {
+  let waitMs = getTokenCooldownMs(tokenEntry);
+  while (waitMs > 0) {
+    const sleepMs = Math.min(waitMs, 5000);
+    console.log(`[${ts()}] TOKEN_COOLDOWN token=${tokenEntry.name} waiting ${sleepMs}ms`);
+    await new Promise((r) => setTimeout(r, sleepMs));
+    waitMs = getTokenCooldownMs(tokenEntry);
+  }
+}
+
+// ── Unified rate limit tracking (per-token, from Anthropic response headers) ──
+const _unifiedRateLimits = new Map(); // tokenName -> { status, 5hUtilization, 7dUtilization, fallbackPct, overageStatus, orgId, updatedAt }
+function captureUnifiedRateHeaders(apiRes, tokenEntry) {
+  const h = apiRes.headers;
+  const data = {
+    status: h["anthropic-ratelimit-unified-status"] || null,
+    h5Status: h["anthropic-ratelimit-unified-5h-status"] || null,
+    h5Utilization: parseFloat(h["anthropic-ratelimit-unified-5h-utilization"]) || 0,
+    d7Status: h["anthropic-ratelimit-unified-7d-status"] || null,
+    d7Utilization: parseFloat(h["anthropic-ratelimit-unified-7d-utilization"]) || 0,
+    fallbackPct: parseFloat(h["anthropic-ratelimit-unified-fallback-percentage"]) || 1,
+    overageStatus: h["anthropic-ratelimit-unified-overage-status"] || null,
+    orgId: h["anthropic-organization-id"] || null,
+    representative: h["anthropic-ratelimit-unified-representative-claim"] || null,
+    updatedAt: Date.now(),
+  };
+  _unifiedRateLimits.set(tokenEntry.name, data);
+}
+function getUnifiedRateLimits() {
+  const result = {};
+  for (const [name, data] of _unifiedRateLimits) {
+    result[name] = { ...data };
+  }
+  return result;
+}
+
 // Backward compat: ANTHROPIC_AUTH still used for logging/health checks
 const ANTHROPIC_AUTH = TOKEN_POOL.length > 0 ? TOKEN_POOL[0] : null;
 if (TOKEN_POOL.length > 0) {
@@ -209,7 +258,7 @@ function leastLoadedWorker(pool) {
  * @returns {object} worker from _workerPool
  */
 function getNextWorker(sessionKey) {
-  const isHealthy = (name) => !_workerHealth.get(name)?.limited;
+  const isHealthy = (name) => isWorkerHealthy(name);
   const healthy = _workerPool.filter((w) => isHealthy(w.name));
 
   if (healthy.length === 0) {
@@ -251,15 +300,36 @@ function getNextWorker(sessionKey) {
   return least;
 }
 
-function markWorkerLimited(workerName) {
+function parseResetTimeFromText(text) {
+  if (!text) return null;
+  const m = text.match(/reset[s]?(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
+  if (!m) return null;
+  let hour = parseInt(m[1], 10);
+  const minute = m[2] ? parseInt(m[2], 10) : 0;
+  const ampm = m[3].toLowerCase();
+  if (ampm === "pm" && hour < 12) hour += 12;
+  if (ampm === "am" && hour == 12) hour = 0;
+  const now = new Date();
+  const target = new Date(now);
+  target.setHours(hour, minute, 0, 0);
+  if (target.getTime() <= now.getTime()) {
+    target.setDate(target.getDate() + 1);
+  }
+  return target.getTime();
+}
+
+function markWorkerLimited(workerName, errText = "") {
   const h = _workerHealth.get(workerName);
   if (h && !h.limited) {
     h.limited = true;
     h.limitedAt = Date.now();
+    const resetAt = parseResetTimeFromText(errText);
+    h.limitedUntil = resetAt || (Date.now() + HEALTH_CHECK_MS);
     _loadBalanceMode = false; // back to single-worker mode
     const other = _workerPool.find((w) => w.name !== workerName);
-    console.log(`[CLIRouter] ${workerName} RATE LIMITED — switching all traffic to ${other?.name || "?"}`);
-    eventLog.push("worker_limited", { worker: workerName, switchedTo: other?.name });
+    const untilStr = h.limitedUntil ? new Date(h.limitedUntil).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }) : "unknown";
+    console.log(`[CLIRouter] ${workerName} RATE LIMITED — switching all traffic to ${other?.name || "?"} (cooldown until ${untilStr})`);
+    eventLog.push("worker_limited", { worker: workerName, switchedTo: other?.name, limitedUntil: h.limitedUntil || null });
   }
 }
 
@@ -268,6 +338,7 @@ function markWorkerRecovered(workerName) {
   if (h && h.limited) {
     h.limited = false;
     h.limitedAt = 0;
+    h.limitedUntil = 0;
     _loadBalanceMode = true; // both workers healthy → share the load
     console.log(`[CLIRouter] ${workerName} RECOVERED — entering load-balance mode (round-robin)`);
     eventLog.push("worker_recovered", { worker: workerName, loadBalance: true });
@@ -286,11 +357,23 @@ function isRateLimitError(exitCode, stderr) {
   );
 }
 
+function isWorkerHealthy(name) {
+  const h = _workerHealth.get(name);
+  if (!h?.limited) return true;
+  if (h.limitedUntil && Date.now() >= h.limitedUntil) {
+    markWorkerRecovered(name);
+    return true;
+  }
+  return false;
+}
+
 // Health check timer: every HEALTH_CHECK_MS, try to recover limited workers
 setInterval(() => {
   for (const w of _workerPool) {
     const h = _workerHealth.get(w.name);
-    if (h.limited && Date.now() - h.limitedAt >= HEALTH_CHECK_MS) {
+    if (!h?.limited) continue;
+    const until = h.limitedUntil || (h.limitedAt + HEALTH_CHECK_MS);
+    if (Date.now() >= until) {
       console.log(`[CLIRouter] Health check: ${w.name} cooldown expired (${Math.round((Date.now() - h.limitedAt) / 1000)}s) — marking recovered`);
       markWorkerRecovered(w.name);
     }
@@ -534,6 +617,7 @@ function gatherMetricsSnapshot() {
     processes: rs,
     liveTokens: rs.liveTokens,
     events: counts,
+    errorsByCategory: { ...workerStats.errors },
     sessionAffinity: sessionAffinity.getStats(),
     systemReaper: systemReaper.getStats(),
     warmPool: warmPool.status(),
@@ -712,15 +796,16 @@ function runCliOnce(prompt, model, systemPrompt, requestId = "", source = "", wo
       clearTimeout(execTimer);
       workerRelease(worker.name);
       if (proc.pid) registry.unregister(proc.pid);
-      // Detect rate limit from stderr
-      if (isRateLimitError(code, stderr)) {
-        markWorkerLimited(worker.name);
+      // Detect rate limit from stderr/stdout
+      const rateErr = isRateLimitError(code, stderr) || isRateLimitError(code, stdout);
+      if (rateErr) {
+        markWorkerLimited(worker.name, stderr || stdout);
       }
       if (code !== 0) {
         const err = new Error(`CLI exit ${code}: ${stderr}`);
         err.exitCode = code;
         err.workerName = worker.name;
-        err.isRateLimit = isRateLimitError(code, stderr);
+        err.isRateLimit = rateErr;
         reject(err);
       } else {
         resolve(stdout.trim());
@@ -805,9 +890,27 @@ function getWorkerByName(name) {
 
 function getAlternateWorker(excludeName) {
   const healthy = _workerPool.filter(
-    (w) => w.name !== excludeName && !_workerHealth.get(w.name)?.limited
+    (w) => w.name !== excludeName && isWorkerHealthy(w.name)
   );
   return healthy.length > 0 ? healthy[0] : null;
+}
+
+function getAllLimitedStatus() {
+  const limited = _workerPool.filter((w) => !isWorkerHealthy(w.name));
+  if (limited.length !== _workerPool.length || limited.length === 0) return null;
+  let nextReset = null;
+  for (const w of limited) {
+    const h = _workerHealth.get(w.name);
+    const until = h?.limitedUntil || (h?.limitedAt ? h.limitedAt + HEALTH_CHECK_MS : null);
+    if (until && (!nextReset || until < nextReset)) nextReset = until;
+  }
+  return { nextReset };
+}
+
+function formatLimitNotice(resetAt) {
+  if (!resetAt) return `[Claude limit reached — switching to ${FALLBACK_API.name} fallback]`;
+  const t = new Date(resetAt).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  return `[Claude limit reached — switching to ${FALLBACK_API.name} fallback until ${t}]`;
 }
 
 // ============================================================
@@ -849,6 +952,7 @@ function streamFromFallbackApi(messages, model, reqId, source, res) {
         let errBody = "";
         apiRes.on("data", (d) => { errBody += d.toString(); });
         apiRes.on("end", () => {
+        clearTimeout(fallbackTimer);
           console.log(`[${ts()}] FALLBACK_ERROR reqId=${reqId} status=${apiRes.statusCode} body=${errBody.slice(0, 200)}`);
           recordWorkerError("fallback", errBody.includes("Context size") ? "context_overflow" : "api_error", `HTTP ${apiRes.statusCode} ${errBody.slice(0, 100)}`);
           safeWrite(sseChunk(reqId, `[Fallback ${fb.name} error: HTTP ${apiRes.statusCode}]`));
@@ -882,7 +986,7 @@ function streamFromFallbackApi(messages, model, reqId, source, res) {
               if (delta) {
                 safeWrite(sseChunk(reqId, delta));
                 outputChars += delta.length;
-                sseBroadcast("chunk", { reqId, model: fb.model, source, text: delta, tokens: outputChars });
+                sseBroadcast("chunk", { reqId, model: fb.model, source, text: delta, tokens: outputChars, worker: "fallback" });
               }
               if (finish) {
                 safeWrite(sseChunk(reqId, null, finish));
@@ -892,9 +996,10 @@ function streamFromFallbackApi(messages, model, reqId, source, res) {
         }
       });
       apiRes.on("end", () => {
+        clearTimeout(fallbackTimer);
         tokenTracker.record(reqId, fb.model, 0, Math.ceil(outputChars / 4));
         eventLog.push("complete", { reqId, mode: "fallback", model: fb.model, source, exitCode: 0, outputChars });
-        sseBroadcast("complete", { reqId, model: fb.model, source, exitCode: 0 });
+        sseBroadcast("complete", { reqId, model: fb.model, source, exitCode: 0, worker: "fallback" });
         if (outputChars === 0) {
           safeWrite(sseChunk(reqId, `[Fallback ${fb.name}: empty response]`));
         }
@@ -905,7 +1010,18 @@ function streamFromFallbackApi(messages, model, reqId, source, res) {
     },
   );
 
+  const fallbackTimer = setTimeout(() => {
+    console.log(`[${ts()}] FALLBACK_TIMEOUT reqId=${reqId} waited=${FALLBACK_TIMEOUT_MS}ms`);
+    recordWorkerError("fallback", "timeout", `timeout ${FALLBACK_TIMEOUT_MS}ms`);
+    safeWrite(sseChunk(reqId, `[Fallback ${fb.name} timeout after ${FALLBACK_TIMEOUT_MS}ms]`));
+    safeWrite(sseChunk(reqId, null, "stop"));
+    safeWrite("data: [DONE]\n\n");
+    safeEnd();
+    try { apiReq.destroy(new Error("fallback timeout")); } catch { /* ignore */ }
+  }, FALLBACK_TIMEOUT_MS);
+
   apiReq.on("error", (err) => {
+    clearTimeout(fallbackTimer);
     console.log(`[${ts()}] FALLBACK_NET_ERROR reqId=${reqId} err=${err.message}`);
     safeWrite(sseChunk(reqId, `[Fallback ${fb.name} unreachable: ${err.message}]`));
     safeWrite(sseChunk(reqId, null, "stop"));
@@ -915,6 +1031,67 @@ function streamFromFallbackApi(messages, model, reqId, source, res) {
 
   apiReq.write(body);
   apiReq.end();
+}
+
+function fetchFallbackSync(messages, model, reqId, source) {
+  const fb = FALLBACK_API;
+  const url = new URL(`${fb.baseUrl}/chat/completions`);
+  const isHttps = url.protocol === "https:";
+  const doRequest = isHttps ? httpsRequest : httpRequest;
+
+  const body = JSON.stringify({
+    model: fb.model,
+    messages,
+    stream: false,
+  });
+
+  console.log(`[${ts()}] FALLBACK_SYNC reqId=${reqId} api=${fb.name} model=${fb.model} src=${source}`);
+  eventLog.push("fallback", { reqId, mode: "sync", model, source, fallbackApi: fb.name, fallbackModel: fb.model });
+
+  return new Promise((resolve, reject) => {
+    const apiReq = doRequest(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${fb.apiKey}`,
+          "content-length": Buffer.byteLength(body),
+        },
+      },
+      (apiRes) => {
+        let buf = "";
+        apiRes.on("data", (d) => { buf += d.toString(); });
+        apiRes.on("end", () => {
+          clearTimeout(fallbackTimer);
+          if (apiRes.statusCode !== 200) {
+            console.log(`[${ts()}] FALLBACK_SYNC_ERROR reqId=${reqId} status=${apiRes.statusCode} body=${buf.slice(0, 200)}`);
+            recordWorkerError("fallback", buf.includes("Context size") ? "context_overflow" : "api_error", `HTTP ${apiRes.statusCode} ${buf.slice(0, 100)}`);
+            return reject(new Error(`Fallback HTTP ${apiRes.statusCode}`));
+          }
+          try {
+            const json = JSON.parse(buf);
+            const content = json.choices?.[0]?.message?.content || json.choices?.[0]?.text || "";
+            if (!content) return resolve("");
+            return resolve(content);
+          } catch (err) {
+            return reject(err);
+          }
+        });
+      },
+    );
+
+    
+
+    apiReq.on("error", (err) => {
+      
+      console.log(`[${ts()}] FALLBACK_SYNC_NET_ERROR reqId=${reqId} err=${err.message}`);
+      reject(err);
+    });
+
+    apiReq.write(body);
+    apiReq.end();
+  });
 }
 
 // ============================================================
@@ -1164,10 +1341,21 @@ function streamFromAnthropicDirect(body, model, reqId, source, res, release, tok
   headers[authHeaderName] = authHeaderValue;
 
   const apiReq = httpsRequest(url, { method: "POST", headers }, (apiRes) => {
+    captureUnifiedRateHeaders(apiRes, tokenEntry);
     if (apiRes.statusCode !== 200) {
       let errBody = "";
       apiRes.on("data", (d) => { errBody += d.toString(); });
       apiRes.on("end", () => {
+
+        if (apiRes.statusCode === 429) {
+          const retryHeader = apiRes.headers["retry-after"];
+          let retryMs = 30000;
+          if (retryHeader) {
+            const sec = Number(retryHeader);
+            if (!Number.isNaN(sec)) retryMs = Math.max(retryMs, sec * 1000);
+          }
+          setTokenCooldown(tokenEntry, retryMs, "anthropic_429");
+        }
         console.log(`[${ts()}] ANTHROPIC_ERROR reqId=${reqId} status=${apiRes.statusCode} body=${errBody.slice(0, 500)}`);
         eventLog.push("error", { reqId, mode: "anthropic_direct", model, source, status: apiRes.statusCode });
         safeWrite(sseChunk(reqId, `[Anthropic API error: HTTP ${apiRes.statusCode}]`));
@@ -1184,6 +1372,7 @@ function streamFromAnthropicDirect(body, model, reqId, source, res, release, tok
     const toolCalls = [];
     let inputTokens = 0;
     let outputTokens = 0;
+    let outputChars = 0;
 
     apiRes.on("data", (chunk) => {
       buf += chunk.toString();
@@ -1210,6 +1399,8 @@ function streamFromAnthropicDirect(body, model, reqId, source, res, release, tok
         } else if (ev.type === "content_block_delta") {
           if (ev.delta?.type === "text_delta" && ev.delta.text) {
             safeWrite(sseChunk(reqId, ev.delta.text));
+            outputChars += ev.delta.text.length;
+            sseBroadcast("chunk", { reqId, model, source, text: ev.delta.text, tokens: outputChars, worker: tokenEntry.name });
           } else if (ev.delta?.type === "input_json_delta" && ev.delta.partial_json !== undefined) {
             const tc = toolCalls[toolCalls.length - 1];
             if (tc) {
@@ -1239,7 +1430,7 @@ function streamFromAnthropicDirect(body, model, reqId, source, res, release, tok
         reqId, mode: "anthropic_direct", model, source,
         inputTokens, outputTokens, toolCalls: toolCalls.length,
       });
-      sseBroadcast("complete", { reqId, model, source, inputTokens, outputTokens });
+      sseBroadcast("complete", { reqId, model, source, inputTokens, outputTokens, worker: tokenEntry.name });
       safeWrite("data: [DONE]\n\n");
       safeEnd();
       doRelease();
@@ -1263,7 +1454,10 @@ function streamFromAnthropicDirect(body, model, reqId, source, res, release, tok
     doRelease();
   });
 
+  
+
   apiReq.on("error", (err) => {
+    
     console.log(`[${ts()}] ANTHROPIC_NET_ERR reqId=${reqId} err=${err.message}`);
     eventLog.push("error", { reqId, mode: "anthropic_direct", model, source, error: err.message });
     safeWrite(sseChunk(reqId, `[Anthropic API unreachable: ${err.message}]`));
@@ -1318,11 +1512,22 @@ function callAnthropicDirect(body, model, reqId, source, tokenEntry) {
     }, SYNC_TIMEOUT_MS);
 
     const apiReq = httpsRequest(url, { method: "POST", headers }, (apiRes) => {
+      captureUnifiedRateHeaders(apiRes, tokenEntry);
       let resBody = "";
       apiRes.on("data", (d) => { resBody += d.toString(); });
       apiRes.on("end", () => {
+
         clearTimeout(timer);
         if (apiRes.statusCode !== 200) {
+          if (apiRes.statusCode === 429) {
+            const retryHeader = apiRes.headers["retry-after"];
+            let retryMs = 30000;
+            if (retryHeader) {
+              const sec = Number(retryHeader);
+              if (!Number.isNaN(sec)) retryMs = Math.max(retryMs, sec * 1000);
+            }
+            setTokenCooldown(tokenEntry, retryMs, "anthropic_429");
+          }
           return reject(new Error(`Anthropic API HTTP ${apiRes.statusCode}: ${resBody.slice(0, 500)}`));
         }
         try {
@@ -1351,7 +1556,10 @@ function callAnthropicDirect(body, model, reqId, source, tokenEntry) {
       });
     });
 
-    apiReq.on("error", (err) => {
+    
+
+  apiReq.on("error", (err) => {
+    
       clearTimeout(timer);
       reject(err);
     });
@@ -1395,14 +1603,16 @@ async function handleApiDirect(body, model, stream, source, req, res) {
   }
 
   rateLimiter.record(model, estTokens);
+  const tokenEntry = getNextToken();
+  await waitForTokenCooldown(tokenEntry);
+  recordWorkerRequest(tokenEntry.name);
   eventLog.push("request", {
     reqId, mode: stream ? "stream_tools" : "sync_tools", model, source, priority,
-    toolCount: body.tools?.length || 0,
+    toolCount: body.tools?.length || 0, worker: tokenEntry.name,
   });
   sseBroadcast("request", {
-    reqId, mode: stream ? "stream_tools" : "sync_tools", model, source, priority,
+    reqId, mode: stream ? "stream_tools" : "sync_tools", model, source, priority, worker: tokenEntry.name,
   });
-  const tokenEntry = getNextToken();
   console.log(
     `[${ts()}] ${stream ? "STREAM" : "SYNC"}_API src=${source} model=${model} ` +
     `tools=${body.tools?.length || 0} token=${tokenEntry.name} reqId=${reqId}`
@@ -1427,6 +1637,11 @@ async function handleApiDirect(body, model, stream, source, req, res) {
       eventLog.push("complete", {
         reqId, mode: "anthropic_direct_sync", model, source, ...result.usage,
       });
+      sseBroadcast("complete", {
+        reqId, model, source, worker: tokenEntry.name,
+        inputTokens: result.usage.prompt_tokens,
+        outputTokens: result.usage.completion_tokens,
+      });
       sendJson(res, 200, completionResponseWithTools(
         reqId, result.content, result.toolCalls, model, result.usage,
       ));
@@ -1434,6 +1649,7 @@ async function handleApiDirect(body, model, stream, source, req, res) {
       release();
       console.error(`[${ts()}] TOOL_REQ_ERROR reqId=${reqId} src=${source} ${err.message}`);
       eventLog.push("error", { reqId, mode: "anthropic_direct", model, source, error: err.message });
+      sseBroadcast("error", { reqId, model, source, worker: tokenEntry.name, error: err.message });
       sendJson(res, 500, { error: { message: err.message, type: "anthropic_api_error" } });
     }
   }
@@ -1538,6 +1754,14 @@ async function handleCompletions(req, res) {
     // Without this, there's a 4-10s gap between headers and first CLI output,
     // causing ~49% of requests to be disconnected by Gateway.
     res.write(":proxy-accepted\n\n");
+
+    const allLimited = getAllLimitedStatus();
+    if (allLimited) {
+      const notice = formatLimitNotice(allLimited.nextReset);
+      res.write(sseChunk(reqId, notice));
+      streamFromFallbackApi(messages, model, reqId, source, res);
+      return;
+    }
 
     // Stream with auto-retry: if a worker fails quickly (<5s, no content),
     // automatically retry on a different worker before giving up.
@@ -1651,7 +1875,7 @@ async function handleCompletions(req, res) {
                 if (canWrite) res.write(sseChunk(reqId, text));
                 outputChars += text.length;
                 sentContent = true;
-                sseBroadcast("chunk", { reqId, model, source, text, tokens: outputChars });
+                sseBroadcast("chunk", { reqId, model, source, text, tokens: outputChars, worker: worker.name });
               }
             } else if (ev.type === "stream_event" && ev.event?.type === "message_delta") {
               const usage = ev.event.usage;
@@ -1669,7 +1893,7 @@ async function handleCompletions(req, res) {
                     if (canWrite) res.write(sseChunk(reqId, b.text));
                     outputChars += b.text.length;
                     sentContent = true;
-                    sseBroadcast("chunk", { reqId, model, source, text: b.text, tokens: outputChars });
+                    sseBroadcast("chunk", { reqId, model, source, text: b.text, tokens: outputChars, worker: worker.name });
                   }
                 }
               }
@@ -1677,7 +1901,7 @@ async function handleCompletions(req, res) {
               if (canWrite) res.write(sseChunk(reqId, ev.delta.text));
               outputChars += ev.delta.text.length;
               sentContent = true;
-              sseBroadcast("chunk", { reqId, model, source, text: ev.delta.text, tokens: outputChars });
+              sseBroadcast("chunk", { reqId, model, source, text: ev.delta.text, tokens: outputChars, worker: worker.name });
             } else if (ev.type === "result" && ev.result && !sentContent) {
               if (canWrite) res.write(sseChunk(reqId, ev.result));
               sentContent = true;
@@ -1714,7 +1938,7 @@ async function handleCompletions(req, res) {
         if (code !== 0 && !sentContent && elapsed < QUICK_FAIL_MS && retryCount < MAX_RETRIES) {
           // Find an untried router, or any alternate
           const untried = _workerPool.find(
-            (w) => !triedRouters.has(w.name) && !_workerHealth.get(w.name)?.limited
+            (w) => !triedRouters.has(w.name) && isWorkerHealthy(w.name)
           );
           const alt = untried || getAlternateWorker(worker.name);
           if (alt) {
@@ -1734,8 +1958,9 @@ async function handleCompletions(req, res) {
           const errCat = code === 143 ? "cli_killed" : "cli_crash";
           recordWorkerError(worker.name, errCat, `code=${code} ${diag.slice(0, 100)}`);
         }
-        if (proc._workerName && (isRateLimitError(code, stderrBuf) || (!sentContent && isRateLimitError(code, buffer)))) {
-          markWorkerLimited(proc._workerName);
+        const rateErr = isRateLimitError(code, stderrBuf) || isRateLimitError(code, buffer);
+        if (proc._workerName && rateErr) {
+          markWorkerLimited(proc._workerName, stderrBuf || buffer);
         }
         // Flush remaining buffer
         const canWrite = !res.writableEnded;
@@ -1765,7 +1990,7 @@ async function handleCompletions(req, res) {
           reqId, mode: "stream", model, source, exitCode: code,
           inputTokens: finalInput, outputTokens: finalOutput,
         });
-        sseBroadcast("complete", { reqId, model, source, exitCode: code, inputTokens: finalInput, outputTokens: finalOutput });
+        sseBroadcast("complete", { reqId, model, source, exitCode: code, inputTokens: finalInput, outputTokens: finalOutput, worker: worker.name });
 
         // Detect model safety refusals — log for diagnostics
         // (The auth preamble should prevent most, but model training may still override)
@@ -1807,7 +2032,7 @@ async function handleCompletions(req, res) {
         // Quick-fail auto-retry on spawn error too
         if (!sentContent && retryCount < MAX_RETRIES) {
           const untried = _workerPool.find(
-            (w) => !triedRouters.has(w.name) && !_workerHealth.get(w.name)?.limited
+            (w) => !triedRouters.has(w.name) && isWorkerHealthy(w.name)
           );
           const alt = untried || getAlternateWorker(worker.name);
           if (alt) {
@@ -1828,6 +2053,26 @@ async function handleCompletions(req, res) {
     pipeStream(null, false);
   } else {
     try {
+      const allLimited = getAllLimitedStatus();
+      if (allLimited) {
+        const notice = formatLimitNotice(allLimited.nextReset);
+        try {
+          const fbResult = await fetchFallbackSync(messages, model, reqId, source);
+          release();
+          const combined = fbResult ? `${notice}
+
+${fbResult}` : notice;
+          sendJson(res, 200, completionResponse(reqId, combined, model));
+          return;
+        } catch (err) {
+          release();
+          const retrySec = allLimited.nextReset ? Math.max(0, Math.round((allLimited.nextReset - Date.now()) / 1000)) : null;
+          return sendJson(res, 503, {
+            error: { message: `Claude limit reached; retry after ${retrySec ?? "unknown"}s`, type: "rate_limited" },
+            retry_after_sec: retrySec,
+          });
+        }
+      }
       const result = await runCli(prompt, model, systemPrompt, reqId, source, sessionKey);
       release();
       // Estimate tokens for sync: prompt chars/4 for input, result chars/4 for output
@@ -1840,6 +2085,26 @@ async function handleCompletions(req, res) {
       });
       sendJson(res, 200, completionResponse(reqId, result, model));
     } catch (err) {
+      if (err.isRateLimit) {
+        const allLimited = getAllLimitedStatus();
+        const notice = formatLimitNotice(allLimited?.nextReset);
+        try {
+          const fbResult = await fetchFallbackSync(messages, model, reqId, source);
+          release();
+          const combined = fbResult ? `${notice}
+
+${fbResult}` : notice;
+          sendJson(res, 200, completionResponse(reqId, combined, model));
+          return;
+        } catch (fbErr) {
+          release();
+          const retrySec = allLimited?.nextReset ? Math.max(0, Math.round((allLimited.nextReset - Date.now()) / 1000)) : null;
+          return sendJson(res, 503, {
+            error: { message: `Claude limit reached; retry after ${retrySec ?? "unknown"}s`, type: "rate_limited" },
+            retry_after_sec: retrySec,
+          });
+        }
+      }
       release();
       eventLog.push("error", { reqId, mode: "sync", model, source, error: err.message });
       console.error(`[${ts()}] ERROR src=${source} ${err.message}`);
@@ -1867,12 +2132,16 @@ function handleHealth(req, res) {
   const rs = registry.getStats();
   const workers = _workerPool.map((w) => {
     const h = _workerHealth.get(w.name);
+    const until = h.limitedUntil || null;
     return {
       name: w.name,
       bin: w.bin,
       limited: h.limited,
       limitedAt: h.limitedAt || null,
       limitedAgoSec: h.limited ? Math.round((Date.now() - h.limitedAt) / 1000) : null,
+      limitedUntil: until,
+      limitedUntilIso: until ? new Date(until).toISOString() : null,
+      limitedRemainingSec: h.limited && until ? Math.max(0, Math.round((until - Date.now()) / 1000)) : null,
     };
   });
   sendJson(res, 200, {
@@ -1898,7 +2167,14 @@ function handleMetrics(req, res) {
   const rs = registry.getStats();
   const workers = _workerPool.map((w) => {
     const h = _workerHealth.get(w.name);
-    return { name: w.name, limited: h.limited, limitedAt: h.limitedAt || null };
+    const until = h.limitedUntil || null;
+    return {
+      name: w.name,
+      limited: h.limited,
+      limitedAt: h.limitedAt || null,
+      limitedUntil: until,
+      limitedRemainingSec: h.limited && until ? Math.max(0, Math.round((until - Date.now()) / 1000)) : null,
+    };
   });
   sendJson(res, 200, {
     rateLimits: RATE_LIMITS,
@@ -1936,6 +2212,7 @@ function handleMetrics(req, res) {
     workerStats,
     activeConnections: Object.fromEntries(_activeConns),
     systemReaper: systemReaper.getStats(),
+    unifiedRateLimits: getUnifiedRateLimits(),
   });
 }
 
@@ -2065,6 +2342,16 @@ function handleSSEStream(req, res) {
 // ============================================================
 
 const server = createServer(async (req, res) => {
+  // Enable TCP keepalive on every connection — detect dead tunnel clients faster
+  // Without this, half-open TCP connections (dead SSH tunnel) can persist for hours
+  const socket = req.socket;
+  if (socket && !socket._keepaliveSet) {
+    socket.setKeepAlive(true, 30_000); // probe every 30s after idle
+    socket.setTimeout(660_000);        // 11 min hard socket timeout (> stream timeout)
+    socket.on("timeout", () => socket.destroy());
+    socket._keepaliveSet = true;
+  }
+
   const url = new URL(req.url, `http://0.0.0.0:${PORT}`);
 
   res.setHeader("access-control-allow-origin", "*");

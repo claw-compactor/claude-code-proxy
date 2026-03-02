@@ -5,19 +5,14 @@
   },
   "workers": [
     {
-      "name": "1",
-      "bin": "/opt/homebrew/bin/claude",
-      "token": "REDACTED"
-    },
-    {
       "name": "3",
       "bin": "/opt/homebrew/bin/claude",
       "token": "REDACTED"
     }
   ],
   "routing": {
-    "primaryWorker": "1",
-    "useCliAgents": true,
+    "primaryWorker": "3",
+    "useCliAgents": false,
     "healthCheckMs": 600000
   },
   "queue": {
@@ -44,14 +39,23 @@
     "reaperIntervalMs": 15000
   },
   "warmPool": {
-    "enabled": true,
-    "size": 2,
+    "enabled": false,
+    "size": 0,
     "maxAgeMs": 300000
   },
   "rateLimits": {
-    "sonnet": { "requestsPerMin": 57, "tokensPerMin": 190000 },
-    "opus": { "requestsPerMin": 28, "tokensPerMin": 57000 },
-    "haiku": { "requestsPerMin": 95, "tokensPerMin": 380000 }
+    "sonnet": {
+      "requestsPerMin": 57,
+      "tokensPerMin": 190000
+    },
+    "opus": {
+      "requestsPerMin": 28,
+      "tokensPerMin": 57000
+    },
+    "haiku": {
+      "requestsPerMin": 95,
+      "tokensPerMin": 380000
+    }
   },
   "anthropic": {
     "apiBase": "https://api.anthropic.com",
@@ -79,10 +83,10 @@
     "helperMinAgeSec": 1800
   },
   "heartbeat": {
-    "opus": 1800000,
-    "sonnet": 1200000,
-    "haiku": 600000,
-    "default": 1200000
+    "opus": 600000,
+    "sonnet": 300000,
+    "haiku": 180000,
+    "default": 300000
   },
   "dashboard": {
     "version": "0.7.0",

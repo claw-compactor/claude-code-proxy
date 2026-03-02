@@ -171,7 +171,7 @@ export function createProcessRegistry(options = {}) {
   // Core operations
   // -------------------------------------------------------
 
-  function register({ pid, requestId, model, mode, source, promptPreview }) {
+  function register({ pid, requestId, model, mode, source, worker, promptPreview }) {
     if (pid == null) return null;
 
     const now = Date.now();
@@ -181,6 +181,7 @@ export function createProcessRegistry(options = {}) {
       model,
       mode,
       source,
+      worker: worker || null,
       promptPreview: (promptPreview || "").slice(0, 80),
       spawnedAt: now,
       lastActivityAt: now,
