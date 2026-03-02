@@ -242,14 +242,22 @@
 </div>
 
 <script>
-// ── Config ──
-// Detect the host we're loaded from to build URLs for other dashboards
+// ── Config (loaded from /health endpoint → proxy.config.json) ──
 const thisHost = window.location.hostname;
+
+// Defaults until /health responds with config from proxy.config.json
+let portalCfg = { openclawPort: 8877, aimmPort: 3000, healthPollMs: 5000, iframeTimeoutMs: 8000 };
+
 const PANELS = {
   proxy:    { url: '/dashboard/proxy', loaded: true },
-  openclaw: { url: `http://${thisHost}:8877/`, loaded: false },
-  aimm:     { url: `http://${thisHost}:3000/dashboard`, loaded: false },
+  openclaw: { url: '', loaded: false },
+  aimm:     { url: '', loaded: false },
 };
+
+function updatePanelUrls() {
+  PANELS.openclaw.url = `http://${thisHost}:${portalCfg.openclawPort}/`;
+  PANELS.aimm.url = `http://${thisHost}:${portalCfg.aimmPort}/dashboard`;
+}
 
 // ── Tab switching ──
 let activePanel = 'proxy';
@@ -263,16 +271,13 @@ document.querySelector('.nav-tabs').addEventListener('click', (e) => {
 });
 
 function switchPanel(panel) {
-  // Deactivate current
   document.getElementById('tab-' + activePanel).classList.remove('active');
   document.getElementById('panel-' + activePanel).classList.remove('active');
 
-  // Activate new
   activePanel = panel;
   document.getElementById('tab-' + panel).classList.add('active');
   document.getElementById('panel-' + panel).classList.add('active');
 
-  // Lazy-load iframe if not yet loaded
   if (!PANELS[panel].loaded) {
     loadPanel(panel);
   }
@@ -286,34 +291,47 @@ function loadPanel(panel) {
 
   if (urlEl) urlEl.textContent = cfg.url;
 
-  // Try to load iframe
   iframe.onerror = () => {
     overlay.classList.add('show');
   };
 
   iframe.onload = () => {
-    // Check if it actually loaded (cross-origin will succeed but we can't check content)
     cfg.loaded = true;
     overlay.classList.remove('show');
   };
 
   iframe.src = cfg.url;
 
-  // Timeout: if iframe doesn't trigger onload within 8s, show offline overlay
   setTimeout(() => {
     if (!cfg.loaded) {
       overlay.classList.add('show');
     }
-  }, 8000);
+  }, portalCfg.iframeTimeoutMs);
 }
 
 // ── Health polling for nav status ──
 let startTime = Date.now();
+let healthInterval = null;
 
 async function checkHealth() {
   try {
     const r = await fetch('/health');
     const d = await r.json();
+
+    // Apply portal config from server (once)
+    if (d.portal) {
+      const changed = portalCfg.openclawPort !== d.portal.openclawPort || portalCfg.aimmPort !== d.portal.aimmPort;
+      portalCfg = d.portal;
+      if (changed) updatePanelUrls();
+
+      // Re-schedule polling if interval changed
+      if (healthInterval && d.portal.healthPollMs && d.portal.healthPollMs !== portalCfg._activeInterval) {
+        clearInterval(healthInterval);
+        healthInterval = setInterval(checkHealth, d.portal.healthPollMs);
+        portalCfg._activeInterval = d.portal.healthPollMs;
+      }
+    }
+
     const uptime = formatDuration(Date.now() - startTime);
     const active = d.queue?.active || 0;
     const tok = d.tokens?.total || 0;
@@ -353,8 +371,9 @@ document.addEventListener('keydown', (e) => {
 });
 
 // ── Init ──
+updatePanelUrls();
 checkHealth();
-setInterval(checkHealth, 5000);
+healthInterval = setInterval(checkHealth, portalCfg.healthPollMs);
 </script>
 </body>
 </html>

@@ -20,7 +20,7 @@
 
 import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -36,52 +36,35 @@ import { createRedisClient } from "./redis-client.mjs";
 import { createSessionAffinity } from "./session-affinity.mjs";
 import { createSystemReaper } from "./system-reaper.mjs";
 import { createWarmPool } from "./worker-pool.mjs";
+import { loadConfig } from "./config-loader.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ============================================================
-// Configuration
+// Configuration — loaded from proxy.config.json (single source of truth)
+// Env vars override config file values for debugging only.
 // ============================================================
 
-const PORT = parseInt(process.env.CLAUDE_PROXY_PORT || "8403", 10);
-const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
-const AUTH_TOKEN = process.env.PROXY_AUTH_TOKEN || "local-proxy";
+const CONFIG = loadConfig();
+
+const PORT = CONFIG.server.port;
+const AUTH_TOKEN = CONFIG.server.authToken;
+const CLAUDE_BIN = CONFIG.workers[0]?.bin || "claude";
 
 // ============================================================
 // CLI Router Objects: smart routing with failover
-// WORKERS env var: JSON array of {name, bin, token} objects
 // Routing strategy:
-//   - Default: all traffic to PRIMARY_WORKER (env, default "2")
+//   - Default: all traffic to PRIMARY_WORKER
 //   - On rate limit: switch entirely to the other CLI router
 //   - Every HEALTH_CHECK_MS: probe if cooled-down router is back
 //   - When recovered: resume load-balancing (round-robin)
 // ============================================================
 
-const PRIMARY_WORKER = process.env.PRIMARY_WORKER || "2";
-const HEALTH_CHECK_MS = parseInt(process.env.HEALTH_CHECK_MS || "600000", 10); // 10 min
-// CLI agent mode: workers are full autonomous agents (all tools enabled, --dangerously-skip-permissions)
-// When true, ALL requests route through CLI workers; API direct path is bypassed.
-const USE_CLI_AGENTS = process.env.USE_CLI_AGENTS === "true";
+const PRIMARY_WORKER = CONFIG.routing.primaryWorker;
+const HEALTH_CHECK_MS = CONFIG.routing.healthCheckMs;
+const USE_CLI_AGENTS = CONFIG.routing.useCliAgents;
 
-// Default worker pool: Mac native + Ubuntu VM (OrbStack)
-const DEFAULT_WORKERS = [
-  { name: "1", bin: "/opt/homebrew/bin/claude" },
-  { name: "2", bin: "/opt/homebrew/bin/claude-ubuntu" },
-];
-
-let _workerPool = [];
-try {
-  if (process.env.WORKERS) {
-    _workerPool = JSON.parse(process.env.WORKERS);
-  }
-} catch (err) {
-  console.warn(`[CLIRouter] Failed to parse WORKERS env: ${err.message} — using defaults`);
-}
-if (_workerPool.length === 0) {
-  _workerPool = DEFAULT_WORKERS;
-}
-// Assign default names if missing
-_workerPool.forEach((w, i) => { if (!w.name) w.name = String(i + 1); });
+const _workerPool = CONFIG.workers;
 
 // Worker health state
 const _workerHealth = new Map(); // name -> { limited: boolean, limitedAt: number }
@@ -100,23 +83,7 @@ console.log(`[CLIRouter] Primary: ${PRIMARY_WORKER} | Health check: ${HEALTH_CHE
 // Forwards as an OpenAI-compatible /v1/chat/completions request
 // ============================================================
 
-const FALLBACK_API = (() => {
-  if (process.env.FALLBACK_API_URL) {
-    return {
-      baseUrl: process.env.FALLBACK_API_URL,
-      apiKey: process.env.FALLBACK_API_KEY || "none",
-      model: process.env.FALLBACK_MODEL || "default",
-      name: process.env.FALLBACK_NAME || "fallback",
-    };
-  }
-  // Default: MiniMax local endpoint
-  return {
-    baseUrl: "http://172.28.216.81:8080/v1",
-    apiKey: "none",
-    model: "MiniMax-M2.5-Q8_0-00001-of-00006.gguf",
-    name: "minimax-local",
-  };
-})();
+const FALLBACK_API = CONFIG.fallback;
 console.log(`[Fallback] ${FALLBACK_API.name} → ${FALLBACK_API.baseUrl} model=${FALLBACK_API.model}`);
 
 // ============================================================
@@ -126,30 +93,26 @@ console.log(`[Fallback] ${FALLBACK_API.name} → ${FALLBACK_API.baseUrl} model=$
 // CLI path remains for text-only requests (flat fee via Max sub).
 // ============================================================
 
-const ANTHROPIC_API_BASE = "https://api.anthropic.com";
-const ANTHROPIC_API_VERSION = "2023-06-01";
+const ANTHROPIC_API_BASE = CONFIG.anthropic.apiBase;
+const ANTHROPIC_API_VERSION = CONFIG.anthropic.apiVersion;
 
-const ANTHROPIC_MODEL_IDS = {
-  sonnet: process.env.ANTHROPIC_SONNET_MODEL || "claude-sonnet-4-6",
-  opus: process.env.ANTHROPIC_OPUS_MODEL || "claude-opus-4-6",
-  haiku: process.env.ANTHROPIC_HAIKU_MODEL || "claude-haiku-4-5-20251001",
-};
+const ANTHROPIC_MODEL_IDS = CONFIG.anthropic.models;
 
 // Token pool for API direct round-robin.
 // Each token represents an independent OAuth credential with its own rate limits.
 // OAuth requires `anthropic-beta: oauth-2025-04-20` header to work with the raw API.
 const TOKEN_POOL = (() => {
   const tokens = [];
-  // Worker tokens from WORKERS env (reuse existing config)
+  // Worker tokens from config (each worker can have its own OAuth token)
   for (const w of _workerPool) {
     if (w.token) tokens.push({ name: w.name, token: w.token, type: "oauth_flat" });
   }
-  // Fallback to process-level CLAUDE_CODE_OAUTH_TOKEN
+  // Fallback to process-level CLAUDE_CODE_OAUTH_TOKEN (env only — not in config file for security)
   if (tokens.length === 0) {
     const oat = process.env.CLAUDE_CODE_OAUTH_TOKEN;
     if (oat) tokens.push({ name: "default", token: oat, type: "oauth_flat" });
   }
-  // Last resort: API key (per-token billing)
+  // Last resort: API key (per-token billing, env only)
   if (tokens.length === 0) {
     const key = process.env.ANTHROPIC_API_KEY;
     if (key) tokens.push({ name: "apikey", token: key, type: "api_key_billed" });
@@ -211,19 +174,32 @@ let _loadBalanceMode = true;
 const _activeConns = new Map(_workerPool.map(w => [w.name, 0]));
 function workerAcquire(name) { _activeConns.set(name, (_activeConns.get(name) || 0) + 1); }
 function workerRelease(name) { const v = _activeConns.get(name) || 0; _activeConns.set(name, Math.max(0, v - 1)); }
+// Round-robin tiebreaker index — prevents pool[0] bias when workers have equal load
+let _leastLoadedRrIndex = 0;
 function leastLoadedWorker(pool) {
-  let best = pool[0];
-  let bestConns = _activeConns.get(best.name) ?? Infinity;
-  let bestTotal = workerStats.traffic[best.name]?.requests ?? 0;
-  for (let i = 1; i < pool.length; i++) {
-    const c = _activeConns.get(pool[i].name) ?? 0;
-    const t = workerStats.traffic[pool[i].name]?.requests ?? 0;
-    // Primary: least active connections; Secondary: least total requests (evens out over time)
-    if (c < bestConns || (c === bestConns && t < bestTotal)) {
-      best = pool[i]; bestConns = c; bestTotal = t;
+  // Collect candidates with identical (conns, totalRequests) as the minimum
+  let minConns = Infinity;
+  let minTotal = Infinity;
+  // First pass: find the minimum (conns, total) pair
+  for (const w of pool) {
+    const c = _activeConns.get(w.name) ?? 0;
+    const t = workerStats.traffic[w.name]?.requests ?? 0;
+    if (c < minConns || (c === minConns && t < minTotal)) {
+      minConns = c;
+      minTotal = t;
     }
   }
-  return best;
+  // Second pass: collect all workers tied at the minimum
+  const tied = pool.filter(w => {
+    const c = _activeConns.get(w.name) ?? 0;
+    const t = workerStats.traffic[w.name]?.requests ?? 0;
+    return c === minConns && t === minTotal;
+  });
+  // Round-robin among tied candidates (avoids pool[0] bias)
+  if (tied.length === 1) return tied[0];
+  const pick = tied[_leastLoadedRrIndex % tied.length];
+  _leastLoadedRrIndex = (_leastLoadedRrIndex + 1) % tied.length;
+  return pick;
 }
 
 /**
@@ -346,7 +322,7 @@ function workerEnv(worker) {
   }
   // Ensure /opt/homebrew/bin + wrapper scripts dir are in PATH
   const path = env.PATH || "/usr/bin:/bin";
-  const homeDir = process.env.HOME || "/Users/duke_nukem_opcdbase";
+  const homeDir = process.env.HOME || "/Users/duke_nukem_opcdbase"; // HOME stays as env (system var)
   const extraPaths = [`${homeDir}/.openclaw/bin`, "/opt/homebrew/bin"];
   let finalPath = path;
   for (const p of extraPaths) {
@@ -371,40 +347,32 @@ function workerEnv(worker) {
   // Setting ELECTRON_RUN_AS_NODE bypasses Electron's safeStorage layer.
   return env;
 }
-const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || "10", 10);
-const MAX_QUEUE_TOTAL = parseInt(process.env.MAX_QUEUE_TOTAL || "200", 10);
-const MAX_QUEUE_PER_SOURCE = parseInt(process.env.MAX_QUEUE_PER_SOURCE || "50", 10);
-const QUEUE_TIMEOUT_MS = parseInt(process.env.QUEUE_TIMEOUT_MS || "300000", 10);
-const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || "3", 10);
-const RETRY_BASE_MS = parseInt(process.env.RETRY_BASE_MS || "2000", 10);
-const STREAM_TIMEOUT_MS = parseInt(process.env.STREAM_TIMEOUT_MS || "1800000", 10);  // 30 min (was 10 min)
-const SYNC_TIMEOUT_MS = parseInt(process.env.SYNC_TIMEOUT_MS || "600000", 10);       // 10 min (was 5 min)
+const MAX_CONCURRENT = CONFIG.queue.maxConcurrent;
+const MAX_QUEUE_TOTAL = CONFIG.queue.maxQueueTotal;
+const MAX_QUEUE_PER_SOURCE = CONFIG.queue.maxQueuePerSource;
+const QUEUE_TIMEOUT_MS = CONFIG.queue.queueTimeoutMs;
+const MAX_RETRIES = CONFIG.retry.maxRetries;
+const RETRY_BASE_MS = CONFIG.retry.retryBaseMs;
+const STREAM_TIMEOUT_MS = CONFIG.timeouts.streamTimeoutMs;
+const SYNC_TIMEOUT_MS = CONFIG.timeouts.syncTimeoutMs;
 
 // Per-model heartbeat timeouts — autonomous agents may go silent during tool execution
-const HEARTBEAT_BY_MODEL = Object.freeze({
-  opus: 1800000,   // 30 min — long tool chains (SSH compile, multi-step ops)
-  sonnet: 1200000, // 20 min
-  haiku: 600000,   // 10 min
-});
-const DEFAULT_HEARTBEAT_MS = 1200000; // 20 min fallback
-const MAX_PROCESS_AGE_MS = parseInt(process.env.MAX_PROCESS_AGE_MS || "1800000", 10);  // 30 min (was 10 min)
-const MAX_IDLE_MS = parseInt(process.env.MAX_IDLE_MS || "600000", 10);                 // 10 min (was 2 min)
-const REAPER_INTERVAL_MS = parseInt(process.env.REAPER_INTERVAL_MS || "15000", 10);
+const HEARTBEAT_BY_MODEL = Object.freeze(CONFIG.heartbeat);
+const DEFAULT_HEARTBEAT_MS = CONFIG.heartbeat.default;
+const MAX_PROCESS_AGE_MS = CONFIG.process.maxProcessAgeMs;
+const MAX_IDLE_MS = CONFIG.process.maxIdleMs;
+const REAPER_INTERVAL_MS = CONFIG.process.reaperIntervalMs;
 
 // Warm Worker Pool: pre-spawns CLI processes to eliminate cold-start latency
-const WARM_POOL_ENABLED = process.env.WARM_POOL_ENABLED !== "false"; // default: on
-const WARM_POOL_SIZE = parseInt(process.env.WARM_POOL_SIZE || "2", 10);
-const WARM_POOL_MAX_AGE_MS = parseInt(process.env.WARM_POOL_MAX_AGE_MS || "300000", 10); // 5 min
+const WARM_POOL_ENABLED = CONFIG.warmPool.enabled;
+const WARM_POOL_SIZE = CONFIG.warmPool.size;
+const WARM_POOL_MAX_AGE_MS = CONFIG.warmPool.maxAgeMs;
 
 // ============================================================
 // Rate Limits — 95% of Claude Max plan limits (shared globally)
 // ============================================================
 
-const RATE_LIMITS = {
-  sonnet: { requestsPerMin: 57, tokensPerMin: 190000 },
-  opus: { requestsPerMin: 28, tokensPerMin: 57000 },
-  haiku: { requestsPerMin: 95, tokensPerMin: 380000 },
-};
+const RATE_LIMITS = CONFIG.rateLimits;
 
 // Model priority mapping
 const MODEL_PRIORITY = { opus: "high", sonnet: "normal", haiku: "low" };
@@ -442,17 +410,8 @@ try {
   redis = null;
 }
 
-// Per-source concurrency limits (env: SOURCE_CONCURRENCY_LIMITS="batch-labeler:15,cron:5")
-const SOURCE_CONCURRENCY_LIMITS = (() => {
-  const raw = process.env.SOURCE_CONCURRENCY_LIMITS || "";
-  const limits = {};
-  for (const part of raw.split(",").filter(Boolean)) {
-    const [src, max] = part.split(":");
-    if (src && max) limits[src.trim()] = parseInt(max.trim(), 10);
-  }
-  return limits;
-})();
-const DEFAULT_SOURCE_CONCURRENCY = parseInt(process.env.DEFAULT_SOURCE_CONCURRENCY || "0", 10);
+const SOURCE_CONCURRENCY_LIMITS = CONFIG.queue.sourceConcurrencyLimits;
+const DEFAULT_SOURCE_CONCURRENCY = CONFIG.queue.defaultSourceConcurrency;
 
 const queue = createFairQueue({
   maxConcurrent: MAX_CONCURRENT,
@@ -485,13 +444,7 @@ const tokenTracker = createTokenTracker({ redis });
 const metricsStore = createMetricsStore({ redis });
 
 // System reaper: periodic cleanup of orphan OS processes
-const systemReaper = createSystemReaper({
-  intervalMs: parseInt(process.env.SYSTEM_REAPER_INTERVAL_MS || "300000", 10),
-  shellMaxAgeSec: parseInt(process.env.SYSTEM_REAPER_SHELL_MAX_AGE || "1800", 10),
-  proxyIdleThresholdSec: parseInt(process.env.SYSTEM_REAPER_PROXY_IDLE || "600", 10),
-  cliMinAgeSec: parseInt(process.env.SYSTEM_REAPER_CLI_MIN_AGE || "300", 10),
-  helperMinAgeSec: parseInt(process.env.SYSTEM_REAPER_HELPER_MIN_AGE || "1800", 10),
-});
+const systemReaper = createSystemReaper(CONFIG.systemReaper);
 
 // Session affinity: sticky routing for conversation sessions
 const sessionAffinity = createSessionAffinity({ ttlMs: 5 * 60 * 1000 }); // 5 min — short TTL for better distribution
@@ -617,7 +570,7 @@ function identifySource(req) {
 
 // Max prompt characters (~50K chars ≈ ~12K tokens, leaves room for CLI agent's own tool calls).
 // Opus has 200K token context; we reserve most of it for the agent's multi-turn tool execution.
-const MAX_PROMPT_CHARS = parseInt(process.env.MAX_PROMPT_CHARS || "50000", 10);
+const MAX_PROMPT_CHARS = CONFIG.limits.maxPromptChars;
 
 function extractPrompt(messages) {
   if (!Array.isArray(messages) || messages.length === 0) {
@@ -1924,7 +1877,7 @@ function handleHealth(req, res) {
   });
   sendJson(res, 200, {
     status: "ok",
-    version: "0.5.1",
+    version: CONFIG.dashboard.version,
     claude_bin: CLAUDE_BIN,
     port: PORT,
     redis: redis ? { connected: redis.isReady() } : { connected: false },
@@ -1935,6 +1888,8 @@ function handleHealth(req, res) {
     tokens: tokenTracker.getTotals(),
     sessionAffinity: sessionAffinity.getStats(),
     workerStats,
+    dashboard: CONFIG.dashboard,
+    portal: CONFIG.portal,
   });
 }
 
@@ -1955,6 +1910,7 @@ function handleMetrics(req, res) {
     queue: qs,
     processes: rs,
     config: {
+      version: CONFIG.dashboard.version,
       useCliAgents: USE_CLI_AGENTS,
       workerCount: _workerPool.length,
       loadBalanceAlgorithm: "least-connections",
@@ -2209,8 +2165,38 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
 // ============================================================
-// Start server
+// Start server (with EADDRINUSE auto-recovery)
 // ============================================================
+
+// Kill stale process holding our port and retry once.
+// This handles the case where a previous instance didn't shut down cleanly.
+let _listenRetried = false;
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE" && !_listenRetried) {
+    _listenRetried = true;
+    console.warn(`[Startup] Port ${PORT} in use — killing stale process and retrying...`);
+    try {
+      // Find PID(s) holding the port and kill them
+      const lsofOut = execSync(`lsof -ti :${PORT}`, { encoding: "utf8", timeout: 5000 }).trim();
+      const pids = lsofOut.split("\n").filter(Boolean).map(Number).filter(p => p !== process.pid);
+      for (const pid of pids) {
+        console.warn(`[Startup] Killing stale PID ${pid} on port ${PORT}`);
+        try { process.kill(pid, "SIGTERM"); } catch { /* already dead */ }
+      }
+      // Wait briefly for port to free up, then retry
+      setTimeout(() => {
+        console.log(`[Startup] Retrying listen on port ${PORT}...`);
+        server.listen(PORT, "0.0.0.0");
+      }, 1500);
+    } catch (killErr) {
+      console.error(`[Startup] Failed to kill stale process: ${killErr.message}`);
+      process.exit(1);
+    }
+  } else {
+    console.error(`[Startup] Server error: ${err.message}`);
+    process.exit(1);
+  }
+});
 
 server.listen(PORT, "0.0.0.0", async () => {
   // Wait for all persistent stores to load from Redis / files

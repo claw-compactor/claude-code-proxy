@@ -431,7 +431,7 @@ async function refresh() {
 
     // Header
     const cfg = metrics.config || {};
-    document.getElementById('version').textContent = 'v0.7.0';
+    document.getElementById('version').textContent = 'v' + (cfg.version || metrics.version || '0.7.0');
     document.getElementById('status-dot').className = 'dot ok';
     document.getElementById('refresh-note').textContent = 'live \u00b7 ' + fmt(Date.now() - startTime);
     const modeBadge = document.getElementById('mode-badge');

@@ -1,0 +1,100 @@
+{
+  "server": {
+    "port": 8403,
+    "authToken": "local-proxy"
+  },
+  "workers": [
+    {
+      "name": "1",
+      "bin": "/opt/homebrew/bin/claude",
+      "token": "REDACTED"
+    },
+    {
+      "name": "3",
+      "bin": "/opt/homebrew/bin/claude",
+      "token": "REDACTED"
+    }
+  ],
+  "routing": {
+    "primaryWorker": "1",
+    "useCliAgents": true,
+    "healthCheckMs": 600000
+  },
+  "queue": {
+    "maxConcurrent": 20,
+    "maxQueueTotal": 200,
+    "maxQueuePerSource": 50,
+    "queueTimeoutMs": 300000,
+    "sourceConcurrencyLimits": {
+      "batch-labeler": 15
+    },
+    "defaultSourceConcurrency": 0
+  },
+  "timeouts": {
+    "streamTimeoutMs": 7200000,
+    "syncTimeoutMs": 1800000
+  },
+  "retry": {
+    "maxRetries": 3,
+    "retryBaseMs": 2000
+  },
+  "process": {
+    "maxProcessAgeMs": 7200000,
+    "maxIdleMs": 3600000,
+    "reaperIntervalMs": 15000
+  },
+  "warmPool": {
+    "enabled": true,
+    "size": 2,
+    "maxAgeMs": 300000
+  },
+  "rateLimits": {
+    "sonnet": { "requestsPerMin": 57, "tokensPerMin": 190000 },
+    "opus": { "requestsPerMin": 28, "tokensPerMin": 57000 },
+    "haiku": { "requestsPerMin": 95, "tokensPerMin": 380000 }
+  },
+  "anthropic": {
+    "apiBase": "https://api.anthropic.com",
+    "apiVersion": "2023-06-01",
+    "models": {
+      "sonnet": "claude-sonnet-4-6",
+      "opus": "claude-opus-4-6",
+      "haiku": "claude-haiku-4-5-20251001"
+    }
+  },
+  "fallback": {
+    "baseUrl": "http://172.28.216.81:8080/v1",
+    "apiKey": "none",
+    "model": "MiniMax-M2.5-Q8_0-00001-of-00006.gguf",
+    "name": "minimax-local"
+  },
+  "limits": {
+    "maxPromptChars": 50000
+  },
+  "systemReaper": {
+    "intervalMs": 300000,
+    "shellMaxAgeSec": 1800,
+    "proxyIdleThresholdSec": 600,
+    "cliMinAgeSec": 300,
+    "helperMinAgeSec": 1800
+  },
+  "heartbeat": {
+    "opus": 1800000,
+    "sonnet": 1200000,
+    "haiku": 600000,
+    "default": 1200000
+  },
+  "dashboard": {
+    "version": "0.7.0",
+    "refreshMs": 2000,
+    "historyRefreshMs": 10000,
+    "reaperRefreshMs": 30000,
+    "eventsLimit": 100
+  },
+  "portal": {
+    "openclawPort": 8877,
+    "aimmPort": 3000,
+    "healthPollMs": 5000,
+    "iframeTimeoutMs": 8000
+  }
+}
