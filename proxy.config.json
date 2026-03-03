@@ -5,9 +5,18 @@
   },
   "workers": [
     {
+      "name": "1",
+      "bin": "/opt/homebrew/bin/claude",
+      "token": "REDACTED",
+      "refreshToken": "REDACTED",
+      "expiresAt": 1772555652212
+    },
+    {
       "name": "3",
       "bin": "/opt/homebrew/bin/claude",
-      "token": "REDACTED"
+      "token": "REDACTED",
+      "refreshToken": "REDACTED",
+      "expiresAt": 1772538356889
     }
   ],
   "routing": {
