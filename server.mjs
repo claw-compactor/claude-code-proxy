@@ -37,6 +37,7 @@ import { createSessionAffinity } from "./session-affinity.mjs";
 import { createSystemReaper } from "./system-reaper.mjs";
 import { createWarmPool } from "./worker-pool.mjs";
 import { loadConfig } from "./config-loader.mjs";
+import { createTokenRefresher } from "./token-refresh.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -173,6 +174,14 @@ function getUnifiedRateLimits() {
   return result;
 }
 
+// ── Token refresher: auto-refresh OAuth tokens on 401 + proactive pre-expiry ──
+const tokenRefresher = createTokenRefresher({
+  tokenPool: TOKEN_POOL,
+  configPath: join(__dirname, "proxy.config.json"),
+  proactiveMarginMs: 300_000, // 5 min before expiry
+  maxBackoffMs: 300_000,
+});
+
 // Backward compat: ANTHROPIC_AUTH still used for logging/health checks
 const ANTHROPIC_AUTH = TOKEN_POOL.length > 0 ? TOKEN_POOL[0] : null;
 if (TOKEN_POOL.length > 0) {
@@ -197,6 +206,7 @@ const workerStats = {
     timeout: 0,         // heartbeat or exec timeout
     queue_timeout: 0,   // queue timeout (waited too long)
     safety_refusal: 0,  // model refused task citing safety/authorization
+    auth_expired: 0,    // OAuth token 401 errors (auto-refresh triggered)
     other: 0,
   },
   // Recent error log (ring buffer, last 100)
@@ -1317,7 +1327,8 @@ function streamFromAnthropicDirect(body, model, reqId, source, res, release, tok
 
   const bodyStr = JSON.stringify(requestBody);
   const authHeaderName = tokenEntry.type === "oauth_flat" ? "authorization" : "x-api-key";
-  const authHeaderValue = tokenEntry.type === "oauth_flat" ? `Bearer ${tokenEntry.token}` : tokenEntry.token;
+  const liveToken = tokenRefresher.getActiveToken(tokenEntry.name) || tokenEntry.token;
+  const authHeaderValue = tokenEntry.type === "oauth_flat" ? `Bearer ${liveToken}` : liveToken;
   console.log(
     `[${ts()}] ANTHROPIC_STREAM reqId=${reqId} model=${anthropicModel} ` +
     `tools=${anthropicTools.length} msgs=${messages.length} auth=${tokenEntry.type} token=${tokenEntry.name} src=${source}`
@@ -1356,6 +1367,19 @@ function streamFromAnthropicDirect(body, model, reqId, source, res, release, tok
           }
           setTokenCooldown(tokenEntry, retryMs, "anthropic_429");
         }
+
+        // 401: OAuth token expired — trigger auto-refresh for next requests
+        if (apiRes.statusCode === 401) {
+          recordWorkerError(tokenEntry.name, "auth_expired", `401: ${errBody.slice(0, 100)}`);
+          tokenRefresher.handleAuthError(tokenEntry).then(result => {
+            if (result.refreshed) {
+              console.log(`[${ts()}] TOKEN_REFRESHED token=${tokenEntry.name} — next requests use new token`);
+            }
+          }).catch(err => {
+            console.error(`[${ts()}] TOKEN_REFRESH_FAIL token=${tokenEntry.name} err=${err.message}`);
+          });
+        }
+
         console.log(`[${ts()}] ANTHROPIC_ERROR reqId=${reqId} status=${apiRes.statusCode} body=${errBody.slice(0, 500)}`);
         eventLog.push("error", { reqId, mode: "anthropic_direct", model, source, status: apiRes.statusCode });
         safeWrite(sseChunk(reqId, `[Anthropic API error: HTTP ${apiRes.statusCode}]`));
@@ -1491,7 +1515,8 @@ function callAnthropicDirect(body, model, reqId, source, tokenEntry) {
 
     const bodyStr = JSON.stringify(requestBody);
     const authHeaderName = tokenEntry.type === "oauth_flat" ? "authorization" : "x-api-key";
-    const authHeaderValue = tokenEntry.type === "oauth_flat" ? `Bearer ${tokenEntry.token}` : tokenEntry.token;
+    const liveTokenSync = tokenRefresher.getActiveToken(tokenEntry.name) || tokenEntry.token;
+    const authHeaderValue = tokenEntry.type === "oauth_flat" ? `Bearer ${liveTokenSync}` : liveTokenSync;
     console.log(
       `[${ts()}] ANTHROPIC_SYNC reqId=${reqId} model=${anthropicModel} ` +
       `tools=${anthropicTools.length} auth=${tokenEntry.type} token=${tokenEntry.name} src=${source}`
@@ -1527,6 +1552,22 @@ function callAnthropicDirect(body, model, reqId, source, tokenEntry) {
               if (!Number.isNaN(sec)) retryMs = Math.max(retryMs, sec * 1000);
             }
             setTokenCooldown(tokenEntry, retryMs, "anthropic_429");
+          }
+          // 401: trigger refresh and mark error for retry
+          if (apiRes.statusCode === 401) {
+            recordWorkerError(tokenEntry.name, "auth_expired", `401: ${resBody.slice(0, 100)}`);
+            tokenRefresher.handleAuthError(tokenEntry).then(refreshResult => {
+              const err = new Error(`Anthropic API HTTP 401: auth error`);
+              err.statusCode = 401;
+              err.refreshed = refreshResult.refreshed;
+              reject(err);
+            }).catch(() => {
+              const err = new Error(`Anthropic API HTTP 401: auth error (refresh failed)`);
+              err.statusCode = 401;
+              err.refreshed = false;
+              reject(err);
+            });
+            return;
           }
           return reject(new Error(`Anthropic API HTTP ${apiRes.statusCode}: ${resBody.slice(0, 500)}`));
         }
@@ -1646,6 +1687,30 @@ async function handleApiDirect(body, model, stream, source, req, res) {
         reqId, result.content, result.toolCalls, model, result.usage,
       ));
     } catch (err) {
+      // 401 with successful refresh — retry once with new token
+      if (err.statusCode === 401 && err.refreshed) {
+        console.log(`[${ts()}] RETRY_AFTER_REFRESH reqId=${reqId} token=${tokenEntry.name}`);
+        try {
+          const retryResult = await callAnthropicDirect(body, model, reqId + "-retry", source, tokenEntry);
+          release();
+          tokenTracker.record(reqId, model, retryResult.usage.prompt_tokens, retryResult.usage.completion_tokens);
+          eventLog.push("complete", {
+            reqId, mode: "anthropic_direct_sync_retry", model, source, ...retryResult.usage,
+          });
+          sseBroadcast("complete", {
+            reqId, model, source, worker: tokenEntry.name,
+            inputTokens: retryResult.usage.prompt_tokens,
+            outputTokens: retryResult.usage.completion_tokens,
+          });
+          sendJson(res, 200, completionResponseWithTools(
+            reqId, retryResult.content, retryResult.toolCalls, model, retryResult.usage,
+          ));
+          return;
+        } catch (retryErr) {
+          console.error(`[${ts()}] RETRY_FAILED reqId=${reqId} ${retryErr.message}`);
+          // Fall through to normal error handling
+        }
+      }
       release();
       console.error(`[${ts()}] TOOL_REQ_ERROR reqId=${reqId} src=${source} ${err.message}`);
       eventLog.push("error", { reqId, mode: "anthropic_direct", model, source, error: err.message });
@@ -2213,6 +2278,7 @@ function handleMetrics(req, res) {
     activeConnections: Object.fromEntries(_activeConns),
     systemReaper: systemReaper.getStats(),
     unifiedRateLimits: getUnifiedRateLimits(),
+    tokenRefreshStatus: tokenRefresher.getStatus(),
   });
 }
 
@@ -2397,6 +2463,13 @@ const server = createServer(async (req, res) => {
       handleMetricsHistory(req, res, url);
     } else if (url.pathname === "/stream" && req.method === "GET") {
       handleSSEStream(req, res);
+    } else if (url.pathname === "/token-refresh" && req.method === "POST") {
+      const chunks = []; for await (const c of req) chunks.push(c);
+      const { tokenName } = JSON.parse(Buffer.concat(chunks).toString());
+      const entry = TOKEN_POOL.find(t => t.name === tokenName);
+      if (!entry) return sendJson(res, 404, { error: { message: `Token ${tokenName} not found` } });
+      const result = await tokenRefresher.handleAuthError(entry);
+      sendJson(res, 200, { result, status: tokenRefresher.getStatus() });
     } else if (url.pathname === "/dashboard/proxy" || url.pathname === "/dashboard/proxy/") {
       await handleProxyDashboard(req, res);
     } else if (url.pathname === "/dashboard" || url.pathname === "/dashboard/") {
@@ -2430,6 +2503,7 @@ function shutdown(signal) {
   metricsStore.destroy();
   systemReaper.destroy();
   sessionAffinity.shutdown();
+  tokenRefresher.destroy();
 
   // Close Redis connection
   if (redis) {
@@ -2501,6 +2575,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   tokenTracker.seedFromHistory(rawSnapshots);
 
   metricsStore.startSampler(gatherMetricsSnapshot);
+  tokenRefresher.start();
 
   // Pre-warm worker pool: spawn processes for the most common configs
   if (WARM_POOL_ENABLED) {

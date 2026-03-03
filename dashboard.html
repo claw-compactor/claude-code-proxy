@@ -658,6 +658,38 @@ async function refresh() {
     // ═══ COLUMN 2: Health & Errors ═══
     let col2 = '';
 
+    // OAuth Token Health (auto-refresh status)
+    const tokenHealth = metrics.tokenRefreshStatus || {};
+    const tokenHealthEntries = Object.entries(tokenHealth);
+    if (tokenHealthEntries.length > 0) {
+      col2 += `<div class="sub-heading">OAuth Token Health</div>`;
+      for (const [tokenName, th] of tokenHealthEntries) {
+        const expiresMs = th.expiresInMs || 0;
+        const expiresHuman = th.expiresInHuman || '-';
+        const expColor = expiresMs > 7200000 ? 'var(--green)' : expiresMs > 1800000 ? 'var(--yellow)' : 'var(--red)';
+        const refreshingIcon = th.isRefreshing ? ' ↻' : '';
+        const lastRefresh = th.lastRefreshAt
+          ? new Date(th.lastRefreshAt).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' })
+          : 'never';
+        const resultIcon = th.lastRefreshResult === 'success' ? '✅'
+          : th.lastRefreshResult === 'error' ? '❌' : '—';
+        const expBarPct = th.expiresAt > 0 ? Math.min(100, Math.max(0, (expiresMs / 28800000) * 100)) : 0;
+        col2 += `<div style="margin-bottom:6px;padding:6px 8px;background:var(--bg);border-radius:4px;border:1px solid var(--bg3)">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+            <span style="font-weight:600;color:var(--blue);font-size:11px">W${tokenName}${refreshingIcon}</span>
+            <span style="font-size:9px;color:var(--text2)">${th.hasRefreshToken ? 'auto-refresh' : 'no refresh token'} · ${th.refreshCount}x</span>
+          </div>
+          <div class="metric"><span class="label">expires in</span><span class="value" style="color:${expColor}">${expiresHuman}</span></div>
+          <div class="bar-wrap"><div class="bar-bg"><div class="bar-fill" style="width:${expBarPct}%;background:${expColor}"></div></div></div>
+          <div class="metric"><span class="label">last refresh</span><span class="value">${resultIcon} ${lastRefresh}</span></div>
+          ${th.consecutiveErrors > 0 ? `<div class="metric"><span class="label">refresh errors</span><span class="value red">${th.consecutiveErrors} consecutive</span></div>` : ''}
+          ${th.authErrorCount > 0 ? `<div class="metric"><span class="label">401s seen</span><span class="value red">${th.authErrorCount}</span></div>` : ''}
+          ${th.lastRefreshError ? `<div class="metric"><span class="label">last error</span><span class="value red" style="font-size:9px;word-break:break-all">${th.lastRefreshError.slice(0, 80)}</span></div>` : ''}
+        </div>`;
+      }
+      col2 += '<hr class="card-divider">';
+    }
+
     // Max Plan Unified Rate Limits (from Anthropic response headers)
     const unified = metrics.unifiedRateLimits || {};
     const unifiedEntries = Object.entries(unified);
@@ -720,6 +752,7 @@ async function refresh() {
         timeout: 'Timeout',
         queue_timeout: 'Queue Timeout',
         safety_refusal: 'Safety Refusal',
+        auth_expired: 'Auth Expired',
         other: 'Other',
       };
       const totalErr = Object.values(ws.errors).reduce((s, v) => s + v, 0);
