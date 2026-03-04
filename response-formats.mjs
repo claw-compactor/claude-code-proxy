@@ -65,6 +65,29 @@ export function sseFinishChunk(id, finishReason) {
 
 // ── Completion Responses ──
 
+const DEFAULT_USAGE = Object.freeze({
+  input_tokens: 0,
+  output_tokens: 0,
+  cache_creation_input_tokens: 0,
+  cache_read_input_tokens: 0,
+  prompt_tokens: 0,
+  completion_tokens: 0,
+  total_tokens: 0,
+});
+
+function normalizeUsage(usage) {
+  const merged = { ...DEFAULT_USAGE, ...(usage || {}) };
+  if (!merged.prompt_tokens) {
+    merged.prompt_tokens =
+      (merged.input_tokens || 0) +
+      (merged.cache_creation_input_tokens || 0) +
+      (merged.cache_read_input_tokens || 0);
+  }
+  if (!merged.completion_tokens) merged.completion_tokens = merged.output_tokens || 0;
+  if (!merged.total_tokens) merged.total_tokens = merged.prompt_tokens + merged.completion_tokens;
+  return merged;
+}
+
 export function completionResponse(id, content, model, usage) {
   return {
     id,
@@ -72,7 +95,7 @@ export function completionResponse(id, content, model, usage) {
     created: Math.floor(Date.now() / 1000),
     model,
     choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
-    usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    usage: normalizeUsage(usage),
   };
 }
 
@@ -95,7 +118,7 @@ export function completionResponseWithTools(id, content, toolCalls, model, usage
       message,
       finish_reason: toolCalls && toolCalls.length > 0 ? "tool_calls" : "stop",
     }],
-    usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    usage: normalizeUsage(usage),
   };
 }
 

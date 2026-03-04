@@ -37,7 +37,8 @@
     "minSystemPrefixChars": 200,
     "keyMaxEntries": 5000,
     "normalizeSystemPrefix": true,
-    "debounceWhitespace": true
+    "debounceWhitespace": true,
+    "sessionScope": "x-session-id"
   },
   "queue": {
     "maxConcurrent": 6,

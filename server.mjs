@@ -289,6 +289,7 @@ const cacheStats = {
   applied: 0,
   hits: 0,
   misses: 0,
+  lastHitAt: null,
   ttftCachedAvg: null,
   ttftUncachedAvg: null,
   recentKeys: new Map(),
@@ -299,11 +300,11 @@ function recordCacheCandidate(count) {
 function recordCacheApplied(count) {
   if (count > 0) cacheStats.applied += count;
 }
-function recordCacheKey(cacheKey) {
-  if (!cacheKey) return { seen: false };
+function recordCacheKey(cacheKeyHash) {
+  if (!cacheKeyHash) return { seen: false };
   const now = Date.now();
-  const seen = cacheStats.recentKeys.has(cacheKey);
-  cacheStats.recentKeys.set(cacheKey, now);
+  const seen = cacheStats.recentKeys.has(cacheKeyHash);
+  cacheStats.recentKeys.set(cacheKeyHash, now);
   if (cacheStats.recentKeys.size > CACHE_KEY_MAX_ENTRIES) {
     // Drop oldest entry to cap memory
     let oldestKey = null;
@@ -313,8 +314,12 @@ function recordCacheKey(cacheKey) {
     }
     if (oldestKey) cacheStats.recentKeys.delete(oldestKey);
   }
-  if (seen) cacheStats.hits++;
-  else cacheStats.misses++;
+  if (seen) {
+    cacheStats.hits++;
+    cacheStats.lastHitAt = now;
+  } else {
+    cacheStats.misses++;
+  }
   return { seen };
 }
 function recordCacheTtft(ttftMs, cached) {
@@ -330,6 +335,8 @@ function getCacheStats() {
     hits: cacheStats.hits,
     misses: cacheStats.misses,
     hitRate: total > 0 ? (cacheStats.hits / total * 100).toFixed(1) + "%" : "0%",
+    lastHitAt: cacheStats.lastHitAt,
+    lastHitIso: cacheStats.lastHitAt ? new Date(cacheStats.lastHitAt).toISOString() : null,
     ttftCachedAvg: cacheStats.ttftCachedAvg,
     ttftUncachedAvg: cacheStats.ttftUncachedAvg,
     recentKeys: cacheStats.recentKeys.size,
@@ -795,6 +802,7 @@ const CACHE_SYSTEM_MIN_PREFIX_CHARS = CONFIG.cacheControl?.minSystemPrefixChars 
 const CACHE_KEY_MAX_ENTRIES = CONFIG.cacheControl?.keyMaxEntries ?? 5000;
 const CACHE_NORMALIZE_SYSTEM_PREFIX = CONFIG.cacheControl?.normalizeSystemPrefix ?? true;
 const CACHE_DEBOUNCE_WHITESPACE = CONFIG.cacheControl?.debounceWhitespace ?? true;
+const CACHE_SESSION_SCOPE = CONFIG.cacheControl?.sessionScope ?? "x-session-id"; // "x-session-id" | "none"
 
 function extractPrompt(messages) {
   if (!Array.isArray(messages) || messages.length === 0) {
@@ -865,6 +873,9 @@ function stableStringify(obj) {
 function hashString(str) {
   return createHash("sha256").update(str).digest("hex").slice(0, 16);
 }
+function buildCacheKey({ tenant, sessionId, model, systemPrefixHash, toolsHash }) {
+  return `t:${tenant}|s:${sessionId || "none"}|m:${model}|sp:${systemPrefixHash}|th:${toolsHash}`;
+}
 function splitSystemForCache(systemText) {
   const normalized = normalizeText(systemText);
   const keyNormalized = normalizeTextForKey(systemText);
@@ -880,7 +891,9 @@ function splitSystemForCache(systemText) {
 }
 function buildCacheContext({ body, model, source, req, applyCacheControl }) {
   const tenant = req?.headers?.["x-tenant-id"] || req?.headers?.["x-openclaw-tenant"] || source || "unknown";
-  const sessionId = req?.headers?.["x-session-id"] || body?.session_id || "";
+  const sessionId = CACHE_SESSION_SCOPE === "none"
+    ? ""
+    : (req?.headers?.["x-session-id"] || body?.session_id || "");
   const systemPrompt = (() => {
     const systemMsg = (body?.messages || []).find((m) => m.role === "system" || m.role === "developer");
     if (!systemMsg) return "";
@@ -890,9 +903,16 @@ function buildCacheContext({ body, model, source, req, applyCacheControl }) {
   const toolsSchema = body?.tools ? stableStringify(body.tools) : "";
   const toolsHash = toolsSchema ? hashString(toolsSchema) : "none";
   const systemPrefixHash = keyPrefix ? hashString(keyPrefix) : "none";
-  const cacheKey = `t:${tenant}|s:${sessionId || "none"}|m:${model}|sp:${systemPrefixHash}|th:${toolsHash}`;
+  const cacheKey = buildCacheKey({ tenant, sessionId, model, systemPrefixHash, toolsHash });
+  const cacheKeyHash = hashString(cacheKey);
   const candidateCount = prefix ? 1 : 0;
   const appliedCount = applyCacheControl && CACHE_CONTROL_ENABLED && cacheable ? 1 : 0;
+  let reason = "ok";
+  if (!CACHE_CONTROL_ENABLED) reason = "cache_control_disabled";
+  else if (!normalized) reason = "no_system";
+  else if (!cacheable) reason = "system_prefix_too_short";
+  else if (!applyCacheControl) reason = "cache_control_not_applied";
+  if (CACHE_SESSION_SCOPE === "none") reason = `${reason}|session_scope=none`;
   return {
     tenant,
     sessionId,
@@ -901,9 +921,11 @@ function buildCacheContext({ body, model, source, req, applyCacheControl }) {
     systemSuffix: suffix,
     cacheableSystem: cacheable,
     cacheKey,
+    cacheKeyHash,
     candidateCount,
     appliedCount,
     toolsHash,
+    reason,
   };
 }
 function buildAnthropicSystemBlocks(systemText, cacheCtx) {
@@ -1440,7 +1462,8 @@ function streamFromAnthropicDirect(body, model, reqId, source, res, release, tok
   if (cacheCtx) {
     console.log(
       `[${ts()}] CACHE_APPLY reqId=${reqId} model=${model} applied=${cacheCtx.appliedCount} ` +
-      `prefixChars=${cacheCtx.systemPrefix?.length || 0} toolsHash=${cacheCtx.toolsHash} key=${cacheCtx.cacheKey}`
+      `prefixChars=${cacheCtx.systemPrefix?.length || 0} toolsHash=${cacheCtx.toolsHash} ` +
+      `cache_key_hash=${cacheCtx.cacheKeyHash} reason=${cacheCtx.reason}`
     );
   }
   const authHeaderName = tokenEntry.type === "oauth_flat" ? "authorization" : "x-api-key";
@@ -1759,12 +1782,12 @@ async function handleApiDirect(body, model, stream, source, req, res) {
   const cacheCtx = buildCacheContext({ body, model, source, req, applyCacheControl: true });
   recordCacheCandidate(cacheCtx.candidateCount);
   recordCacheApplied(cacheCtx.appliedCount);
-  const cacheSeen = recordCacheKey(cacheCtx.cacheKey);
+  const cacheSeen = recordCacheKey(cacheCtx.cacheKeyHash);
   console.log(
     `[${ts()}] CACHE_CTX reqId=${reqId} src=${source} tenant=${cacheCtx.tenant} model=${model} ` +
     `candidate=${cacheCtx.candidateCount} applied=${cacheCtx.appliedCount} ` +
-    `hitEst=${cacheSeen.seen ? "hit" : "miss"} hitRate=${getCacheStats().hitRate} ` +
-    `key=${cacheCtx.cacheKey}`
+    `hit=${cacheSeen.seen ? "hit" : "miss"} hitRate=${getCacheStats().hitRate} ` +
+    `cache_key_hash=${cacheCtx.cacheKeyHash} reason=${cacheCtx.reason}`
   );
 
   let release;
@@ -1924,7 +1947,7 @@ async function handleCompletions(req, res) {
   const cacheCtx = buildCacheContext({ body, model, source, req, applyCacheControl: false });
   recordCacheCandidate(cacheCtx.candidateCount);
   recordCacheApplied(cacheCtx.appliedCount);
-  const cacheSeen = recordCacheKey(cacheCtx.cacheKey);
+  const cacheSeen = recordCacheKey(cacheCtx.cacheKeyHash);
 
   const priority = MODEL_PRIORITY[model] || "normal";
   // Estimated tokens for rate-limiter: use a small fixed cap.
@@ -1938,8 +1961,8 @@ async function handleCompletions(req, res) {
   console.log(
     `[${ts()}] CACHE_CTX reqId=${reqId} src=${source} tenant=${cacheCtx.tenant} model=${model} ` +
     `candidate=${cacheCtx.candidateCount} applied=${cacheCtx.appliedCount} ` +
-    `hitEst=${cacheSeen.seen ? "hit" : "miss"} hitRate=${getCacheStats().hitRate} ` +
-    `key=${cacheCtx.cacheKey}`
+    `hit=${cacheSeen.seen ? "hit" : "miss"} hitRate=${getCacheStats().hitRate} ` +
+    `cache_key_hash=${cacheCtx.cacheKeyHash} reason=${cacheCtx.reason}`
   );
 
   // Acquire slot via fair queue (waits for turn, never rejects)

@@ -193,6 +193,7 @@ Anthropic prompt cache optimization:
 - `minSystemPrefixChars`: Minimum prefix to bother caching
 - `normalizeSystemPrefix`: Normalize system prefix (trim, normalize newlines)
 - `debounceWhitespace`: Collapse whitespace noise for stable cache keys
+- `sessionScope`: `x-session-id` (default) or `none` for cross-session cache sharing
 
 See `docs/cache-optimization.md` for hit-rate tactics and anti-patterns.
 
