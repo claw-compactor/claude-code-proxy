@@ -21,7 +21,7 @@
 import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { spawn, execSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -277,6 +277,59 @@ function recordWorkerError(workerName, category, detail) {
   else workerStats.errors.other++;
   workerStats.recentErrors.push({ ts: Date.now(), worker: workerName, category, detail: (detail || "").slice(0, 200) });
   if (workerStats.recentErrors.length > 100) workerStats.recentErrors.shift();
+}
+
+// Cache stats: prompt caching eligibility + TTFT comparison
+const cacheStats = {
+  candidates: 0,
+  applied: 0,
+  hits: 0,
+  misses: 0,
+  ttftCachedAvg: null,
+  ttftUncachedAvg: null,
+  recentKeys: new Map(),
+};
+function recordCacheCandidate(count) {
+  if (count > 0) cacheStats.candidates += count;
+}
+function recordCacheApplied(count) {
+  if (count > 0) cacheStats.applied += count;
+}
+function recordCacheKey(cacheKey) {
+  if (!cacheKey) return { seen: false };
+  const now = Date.now();
+  const seen = cacheStats.recentKeys.has(cacheKey);
+  cacheStats.recentKeys.set(cacheKey, now);
+  if (cacheStats.recentKeys.size > CACHE_KEY_MAX_ENTRIES) {
+    // Drop oldest entry to cap memory
+    let oldestKey = null;
+    let oldestAt = Infinity;
+    for (const [key, tsValue] of cacheStats.recentKeys) {
+      if (tsValue < oldestAt) { oldestAt = tsValue; oldestKey = key; }
+    }
+    if (oldestKey) cacheStats.recentKeys.delete(oldestKey);
+  }
+  if (seen) cacheStats.hits++;
+  else cacheStats.misses++;
+  return { seen };
+}
+function recordCacheTtft(ttftMs, cached) {
+  const key = cached ? "ttftCachedAvg" : "ttftUncachedAvg";
+  const prev = cacheStats[key];
+  cacheStats[key] = prev == null ? ttftMs : Math.round(prev * 0.8 + ttftMs * 0.2);
+}
+function getCacheStats() {
+  const total = cacheStats.hits + cacheStats.misses;
+  return {
+    candidates: cacheStats.candidates,
+    applied: cacheStats.applied,
+    hits: cacheStats.hits,
+    misses: cacheStats.misses,
+    hitRate: total > 0 ? (cacheStats.hits / total * 100).toFixed(1) + "%" : "0%",
+    ttftCachedAvg: cacheStats.ttftCachedAvg,
+    ttftUncachedAvg: cacheStats.ttftUncachedAvg,
+    recentKeys: cacheStats.recentKeys.size,
+  };
 }
 
 // _loadBalanceMode starts true: round-robin across all healthy workers
@@ -594,7 +647,7 @@ const metricsStore = createMetricsStore({ redis });
 const systemReaper = createSystemReaper(CONFIG.systemReaper);
 
 // Session affinity: sticky routing for conversation sessions
-const sessionAffinity = createSessionAffinity({ ttlMs: 5 * 60 * 1000 }); // 5 min — short TTL for better distribution
+const sessionAffinity = createSessionAffinity({ ttlMs: CONFIG.sessionAffinity?.ttlMs ?? 30 * 60 * 1000 });
 
 // Warm worker pool: pre-spawns CLI processes to eliminate 2-5s cold start
 const warmPool = createWarmPool({
@@ -684,6 +737,7 @@ function gatherMetricsSnapshot() {
     errorsByCategory: { ...workerStats.errors },
     sessionAffinity: sessionAffinity.getStats(),
     systemReaper: systemReaper.getStats(),
+    cache: getCacheStats(),
     warmPool: warmPool.status(),
   };
 }
@@ -724,6 +778,12 @@ const MAX_BODY_BYTES = CONFIG.limits?.maxBodyBytes || 5_000_000;
 const MAX_PROMPT_TOKENS = CONFIG.limits?.maxPromptTokens || 190000;
 const APPROX_CHARS_PER_TOKEN = 3; // conservative to avoid 200k hard limit
 
+// Anthropic cache_control tuning
+const CACHE_CONTROL_ENABLED = CONFIG.cacheControl?.enabled ?? true;
+const CACHE_SYSTEM_PREFIX_CHARS = CONFIG.cacheControl?.systemPrefixChars ?? 1200;
+const CACHE_SYSTEM_MIN_PREFIX_CHARS = CONFIG.cacheControl?.minSystemPrefixChars ?? 200;
+const CACHE_KEY_MAX_ENTRIES = CONFIG.cacheControl?.keyMaxEntries ?? 5000;
+
 function extractPrompt(messages) {
   if (!Array.isArray(messages) || messages.length === 0) {
     return { prompt: "", systemPrompt: null };
@@ -762,6 +822,69 @@ function extractPrompt(messages) {
   }
 
   return { prompt: kept.join("\n\n"), systemPrompt };
+}
+
+// ── Cache-control helpers (Anthropic prompt caching) ──
+function normalizeText(text) {
+  return String(text || "").replace(/\r\n/g, "\n").trim();
+}
+function stableStringify(obj) {
+  if (obj === null || typeof obj !== "object") return JSON.stringify(obj);
+  if (Array.isArray(obj)) return `[${obj.map(stableStringify).join(",")}]`;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
+}
+function hashString(str) {
+  return createHash("sha256").update(str).digest("hex").slice(0, 16);
+}
+function splitSystemForCache(systemText) {
+  const normalized = normalizeText(systemText);
+  if (!normalized) return { normalized: "", prefix: "", suffix: "", cacheable: false };
+  const prefixLen = Math.min(CACHE_SYSTEM_PREFIX_CHARS, normalized.length);
+  if (prefixLen < CACHE_SYSTEM_MIN_PREFIX_CHARS) {
+    return { normalized, prefix: "", suffix: normalized, cacheable: false };
+  }
+  const prefix = normalized.slice(0, prefixLen);
+  const suffix = normalized.slice(prefixLen);
+  return { normalized, prefix, suffix, cacheable: true };
+}
+function buildCacheContext({ body, model, source, req, applyCacheControl }) {
+  const tenant = req?.headers?.["x-tenant-id"] || req?.headers?.["x-openclaw-tenant"] || source || "unknown";
+  const sessionId = req?.headers?.["x-session-id"] || body?.session_id || "";
+  const systemPrompt = (() => {
+    const systemMsg = (body?.messages || []).find((m) => m.role === "system" || m.role === "developer");
+    if (!systemMsg) return "";
+    return typeof systemMsg.content === "string" ? systemMsg.content : JSON.stringify(systemMsg.content);
+  })();
+  const { normalized, prefix, suffix, cacheable } = splitSystemForCache(systemPrompt);
+  const toolsSchema = body?.tools ? stableStringify(body.tools) : "";
+  const toolsHash = toolsSchema ? hashString(toolsSchema) : "none";
+  const systemPrefixHash = prefix ? hashString(prefix) : "none";
+  const cacheKey = `t:${tenant}|s:${sessionId || "none"}|m:${model}|sp:${systemPrefixHash}|th:${toolsHash}`;
+  const candidateCount = prefix ? 1 : 0;
+  const appliedCount = applyCacheControl && CACHE_CONTROL_ENABLED && cacheable ? 1 : 0;
+  return {
+    tenant,
+    sessionId,
+    systemNormalized: normalized,
+    systemPrefix: prefix,
+    systemSuffix: suffix,
+    cacheableSystem: cacheable,
+    cacheKey,
+    candidateCount,
+    appliedCount,
+    toolsHash,
+  };
+}
+function buildAnthropicSystemBlocks(systemText, cacheCtx) {
+  if (!systemText) return null;
+  const { normalized, prefix, suffix, cacheable } = splitSystemForCache(systemText);
+  if (CACHE_CONTROL_ENABLED && cacheable && cacheCtx?.appliedCount > 0 && prefix) {
+    const blocks = [{ type: "text", text: prefix, cache_control: { type: "ephemeral" } }];
+    if (suffix) blocks.push({ type: "text", text: suffix });
+    return blocks;
+  }
+  return [{ type: "text", text: normalized }];
 }
 
 // --- Anthropic Direct API context guard (approximate token count) ---
@@ -1235,7 +1358,7 @@ function fetchFallbackSync(messages, model, reqId, source) {
  * Stream response from Anthropic Messages API, converting to OpenAI SSE.
  * Handles text content + tool_use blocks.
  */
-function streamFromAnthropicDirect(body, model, reqId, source, res, release, tokenEntry) {
+function streamFromAnthropicDirect(body, model, reqId, source, res, release, tokenEntry, cacheCtx) {
   const anthropicModel = ANTHROPIC_MODEL_IDS[model] || ANTHROPIC_MODEL_IDS.sonnet;
   const anthropicTools = body.tools ? convertToolsToAnthropic(body.tools) : [];
   const { system, messages } = convertMessagesToAnthropic(body.messages);
@@ -1250,7 +1373,10 @@ function streamFromAnthropicDirect(body, model, reqId, source, res, release, tok
     stream: true,
     messages: trimmed.messages,
   };
-  if (trimmed.system) requestBody.system = trimmed.system;
+  if (trimmed.system) {
+    const systemBlocks = buildAnthropicSystemBlocks(trimmed.system, cacheCtx);
+    if (systemBlocks) requestBody.system = systemBlocks;
+  }
   if (anthropicTools.length > 0) requestBody.tools = anthropicTools;
   if (body.tool_choice) {
     if (body.tool_choice === "auto") requestBody.tool_choice = { type: "auto" };
@@ -1262,6 +1388,12 @@ function streamFromAnthropicDirect(body, model, reqId, source, res, release, tok
   }
 
   const bodyStr = JSON.stringify(requestBody);
+  if (cacheCtx) {
+    console.log(
+      `[${ts()}] CACHE_APPLY reqId=${reqId} model=${model} applied=${cacheCtx.appliedCount} ` +
+      `prefixChars=${cacheCtx.systemPrefix?.length || 0} toolsHash=${cacheCtx.toolsHash} key=${cacheCtx.cacheKey}`
+    );
+  }
   const authHeaderName = tokenEntry.type === "oauth_flat" ? "authorization" : "x-api-key";
   const liveToken = tokenRefresher.getActiveToken(tokenEntry.name) || tokenEntry.token;
   const authHeaderValue = tokenEntry.type === "oauth_flat" ? `Bearer ${liveToken}` : liveToken;
@@ -1272,6 +1404,10 @@ function streamFromAnthropicDirect(body, model, reqId, source, res, release, tok
   eventLog.push("anthropic_direct", {
     reqId, model: anthropicModel, tools: anthropicTools.length, source, auth: tokenEntry.type, token: tokenEntry.name,
   });
+
+  const requestStart = Date.now();
+  let firstTokenAt = null;
+  const cacheApplied = cacheCtx?.appliedCount > 0;
 
   const safeWrite = (data) => { if (!res.writableEnded) res.write(data); };
   const safeEnd = () => { if (!res.writableEnded) res.end(); };
@@ -1358,6 +1494,15 @@ function streamFromAnthropicDirect(body, model, reqId, source, res, release, tok
           // text blocks and thinking blocks: no special start action needed
         } else if (ev.type === "content_block_delta") {
           if (ev.delta?.type === "text_delta" && ev.delta.text) {
+            if (!firstTokenAt) {
+              firstTokenAt = Date.now();
+              const ttftMs = firstTokenAt - requestStart;
+              recordCacheTtft(ttftMs, cacheApplied);
+              console.log(
+                `[${ts()}] CACHE_TTFT reqId=${reqId} model=${model} cached=${cacheApplied} ` +
+                `ttftMs=${ttftMs} cachedAvg=${cacheStats.ttftCachedAvg ?? "n/a"} uncachedAvg=${cacheStats.ttftUncachedAvg ?? "n/a"}`
+              );
+            }
             safeWrite(sseChunk(reqId, ev.delta.text));
             outputChars += ev.delta.text.length;
             sseBroadcast("chunk", { reqId, model, source, text: ev.delta.text, tokens: outputChars, worker: tokenEntry.name });
@@ -1435,7 +1580,7 @@ function streamFromAnthropicDirect(body, model, reqId, source, res, release, tok
  * Call Anthropic Messages API synchronously (non-streaming).
  * Returns { content, toolCalls, usage, stopReason }.
  */
-function callAnthropicDirect(body, model, reqId, source, tokenEntry) {
+function callAnthropicDirect(body, model, reqId, source, tokenEntry, cacheCtx) {
   return new Promise((resolve, reject) => {
     const anthropicModel = ANTHROPIC_MODEL_IDS[model] || ANTHROPIC_MODEL_IDS.sonnet;
     const anthropicTools = body.tools ? convertToolsToAnthropic(body.tools) : [];
@@ -1450,7 +1595,10 @@ function callAnthropicDirect(body, model, reqId, source, tokenEntry) {
       max_tokens: body.max_tokens || 16384,
       messages: trimmed.messages,
     };
-    if (trimmed.system) requestBody.system = trimmed.system;
+    if (trimmed.system) {
+      const systemBlocks = buildAnthropicSystemBlocks(trimmed.system, cacheCtx);
+      if (systemBlocks) requestBody.system = systemBlocks;
+    }
     if (anthropicTools.length > 0) requestBody.tools = anthropicTools;
 
     const bodyStr = JSON.stringify(requestBody);
@@ -1558,6 +1706,16 @@ async function handleApiDirect(body, model, stream, source, req, res) {
   const priority = MODEL_PRIORITY[model] || "normal";
   const estTokens = Math.min(Math.ceil(JSON.stringify(body.messages).length / 4), 5000);
   const reqId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+  const cacheCtx = buildCacheContext({ body, model, source, req, applyCacheControl: true });
+  recordCacheCandidate(cacheCtx.candidateCount);
+  recordCacheApplied(cacheCtx.appliedCount);
+  const cacheSeen = recordCacheKey(cacheCtx.cacheKey);
+  console.log(
+    `[${ts()}] CACHE_CTX reqId=${reqId} src=${source} tenant=${cacheCtx.tenant} model=${model} ` +
+    `candidate=${cacheCtx.candidateCount} applied=${cacheCtx.appliedCount} ` +
+    `hitEst=${cacheSeen.seen ? "hit" : "miss"} hitRate=${getCacheStats().hitRate} ` +
+    `key=${cacheCtx.cacheKey}`
+  );
 
   let release;
   try {
@@ -1609,10 +1767,10 @@ async function handleApiDirect(body, model, stream, source, req, res) {
     res.flushHeaders();
     if (res.socket) res.socket.setNoDelay(true);
 
-    streamFromAnthropicDirect(body, model, reqId, source, res, release, tokenEntry);
+    streamFromAnthropicDirect(body, model, reqId, source, res, release, tokenEntry, cacheCtx);
   } else {
     try {
-      const result = await callAnthropicDirect(body, model, reqId, source, tokenEntry);
+      const result = await callAnthropicDirect(body, model, reqId, source, tokenEntry, cacheCtx);
       release();
       tokenTracker.record(reqId, model, result.usage.prompt_tokens, result.usage.completion_tokens);
       eventLog.push("complete", {
@@ -1631,7 +1789,7 @@ async function handleApiDirect(body, model, stream, source, req, res) {
       if (err.statusCode === 401 && err.refreshed) {
         console.log(`[${ts()}] RETRY_AFTER_REFRESH reqId=${reqId} token=${tokenEntry.name}`);
         try {
-          const retryResult = await callAnthropicDirect(body, model, reqId + "-retry", source, tokenEntry);
+          const retryResult = await callAnthropicDirect(body, model, reqId + "-retry", source, tokenEntry, cacheCtx);
           release();
           tokenTracker.record(reqId, model, retryResult.usage.prompt_tokens, retryResult.usage.completion_tokens);
           eventLog.push("complete", {
@@ -1704,6 +1862,11 @@ async function handleCompletions(req, res) {
   });
 
   const model = resolveModel(rawModel);
+  const cacheCtx = buildCacheContext({ body, model, source, req, applyCacheControl: false });
+  recordCacheCandidate(cacheCtx.candidateCount);
+  recordCacheApplied(cacheCtx.appliedCount);
+  const cacheSeen = recordCacheKey(cacheCtx.cacheKey);
+
   const priority = MODEL_PRIORITY[model] || "normal";
   // Estimated tokens for rate-limiter: use a small fixed cap.
   // chars/4 wildly over-estimates (code/JSON has low token density).
@@ -1712,6 +1875,13 @@ async function handleCompletions(req, res) {
   // can coexist (57000/5000).  If Anthropic 429s, the retry loop handles it.
   const estTokens = Math.min(Math.ceil(prompt.length / 4), 5000);
   const reqId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+
+  console.log(
+    `[${ts()}] CACHE_CTX reqId=${reqId} src=${source} tenant=${cacheCtx.tenant} model=${model} ` +
+    `candidate=${cacheCtx.candidateCount} applied=${cacheCtx.appliedCount} ` +
+    `hitEst=${cacheSeen.seen ? "hit" : "miss"} hitRate=${getCacheStats().hitRate} ` +
+    `key=${cacheCtx.cacheKey}`
+  );
 
   // Acquire slot via fair queue (waits for turn, never rejects)
   let release;
@@ -2166,6 +2336,7 @@ function handleHealth(req, res) {
     processes: { tracked: rs.total, byMode: rs.byMode, liveTokens: rs.liveTokens },
     tokens: tokenTracker.getTotals(),
     sessionAffinity: sessionAffinity.getStats(),
+    cache: getCacheStats(),
     workerStats,
     dashboard: CONFIG.dashboard,
     portal: CONFIG.portal,
@@ -2213,12 +2384,14 @@ function handleMetrics(req, res) {
       maxProcessAgeMs: MAX_PROCESS_AGE_MS,
       maxIdleMs: MAX_IDLE_MS,
       reaperIntervalMs: REAPER_INTERVAL_MS,
-      sessionAffinityTtlMs: 5 * 60 * 1000,
+      sessionAffinityTtlMs: CONFIG.sessionAffinity?.ttlMs ?? 30 * 60 * 1000,
+      cacheControl: CONFIG.cacheControl,
       sseKeepaliveMs: 30_000,
       maxRetries: MAX_RETRIES,
       retryBaseMs: RETRY_BASE_MS,
     },
     sessionAffinity: sessionAffinity.getStats(),
+    cache: getCacheStats(),
     workerStats,
     activeConnections: Object.fromEntries(_activeConns),
     systemReaper: systemReaper.getStats(),

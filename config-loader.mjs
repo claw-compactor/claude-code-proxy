@@ -226,6 +226,15 @@ export function loadConfig() {
   const warmPoolSize = resolve(file, "warmPool.size", "WARM_POOL_SIZE", 2, toInt);
   const warmPoolMaxAgeMs = resolve(file, "warmPool.maxAgeMs", "WARM_POOL_MAX_AGE_MS", 300000, toInt);
 
+  const sessionAffinityTtlMs = resolve(file, "sessionAffinity.ttlMs", "SESSION_AFFINITY_TTL_MS", 30 * 60 * 1000, toInt);
+
+  const cacheControl = {
+    enabled: resolve(file, "cacheControl.enabled", "CACHE_CONTROL_ENABLED", true, toBool),
+    systemPrefixChars: resolve(file, "cacheControl.systemPrefixChars", "CACHE_CONTROL_SYSTEM_PREFIX_CHARS", 1200, toInt),
+    minSystemPrefixChars: resolve(file, "cacheControl.minSystemPrefixChars", "CACHE_CONTROL_MIN_SYSTEM_PREFIX_CHARS", 200, toInt),
+    keyMaxEntries: resolve(file, "cacheControl.keyMaxEntries", "CACHE_CONTROL_KEY_MAX_ENTRIES", 5000, toInt),
+  };
+
   const rateLimits = get(file, "rateLimits") || {
     sonnet: { requestsPerMin: 57, tokensPerMin: 190000 },
     opus: { requestsPerMin: 28, tokensPerMin: 57000 },
@@ -340,6 +349,8 @@ export function loadConfig() {
     retry: { maxRetries, retryBaseMs },
     process: { maxProcessAgeMs, maxIdleMs, reaperIntervalMs },
     warmPool: { enabled: warmPoolEnabled, size: warmPoolSize, maxAgeMs: warmPoolMaxAgeMs },
+    sessionAffinity: { ttlMs: sessionAffinityTtlMs },
+    cacheControl,
     rateLimits,
     anthropic: { apiBase: anthropicApiBase, apiVersion: anthropicApiVersion, models: anthropicModels },
     fallback,

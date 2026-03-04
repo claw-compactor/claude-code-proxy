@@ -34,6 +34,15 @@
     "useCliAgents": false,
     "healthCheckMs": 600000
   },
+  "sessionAffinity": {
+    "ttlMs": 1800000
+  },
+  "cacheControl": {
+    "enabled": true,
+    "systemPrefixChars": 1200,
+    "minSystemPrefixChars": 200,
+    "keyMaxEntries": 5000
+  },
   "queue": {
     "maxConcurrent": 6,
     "maxQueueTotal": 200,
