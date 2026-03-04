@@ -199,10 +199,6 @@
       <span class="tab-dot" style="background:var(--purple)"></span>
       <span>Sessions</span>
     </button>
-    <button class="nav-tab" data-panel="aimm" id="tab-aimm">
-      <span class="tab-dot" style="background:var(--cyan)"></span>
-      <span>AIMM</span>
-    </button>
   </div>
 
   <div class="nav-status">
@@ -229,16 +225,6 @@
     </div>
   </div>
 
-  <!-- AIMM Dashboard -->
-  <div class="panel" id="panel-aimm">
-    <iframe data-src="" id="iframe-aimm"></iframe>
-    <div class="offline-overlay" id="offline-aimm">
-      <span class="offline-icon">🔌</span>
-      <span class="offline-msg">AIMM Dashboard not reachable</span>
-      <span class="offline-url" id="url-aimm"></span>
-      <button class="retry-btn" onclick="loadPanel('aimm')">Retry</button>
-    </div>
-  </div>
 </div>
 
 <script>
@@ -246,17 +232,15 @@
 const thisHost = window.location.hostname;
 
 // Defaults until /health responds with config from proxy.config.json
-let portalCfg = { openclawPort: 8877, aimmPort: 3000, healthPollMs: 5000, iframeTimeoutMs: 8000 };
+let portalCfg = { openclawPort: 8877, healthPollMs: 5000, iframeTimeoutMs: 8000 };
 
 const PANELS = {
   proxy:    { url: '/dashboard/proxy', loaded: true },
   openclaw: { url: '', loaded: false },
-  aimm:     { url: '', loaded: false },
 };
 
 function updatePanelUrls() {
   PANELS.openclaw.url = `http://${thisHost}:${portalCfg.openclawPort}/`;
-  PANELS.aimm.url = `http://${thisHost}:${portalCfg.aimmPort}/dashboard`;
 }
 
 // ── Tab switching ──
@@ -320,7 +304,7 @@ async function checkHealth() {
 
     // Apply portal config from server (once)
     if (d.portal) {
-      const changed = portalCfg.openclawPort !== d.portal.openclawPort || portalCfg.aimmPort !== d.portal.aimmPort;
+      const changed = portalCfg.openclawPort !== d.portal.openclawPort;
       portalCfg = d.portal;
       if (changed) updatePanelUrls();
 
@@ -367,7 +351,7 @@ document.addEventListener('keydown', (e) => {
   if (e.altKey || e.metaKey || e.ctrlKey) return;
   if (e.key === '1') switchPanel('proxy');
   if (e.key === '2') switchPanel('openclaw');
-  if (e.key === '3') switchPanel('aimm');
+  if (e.key === '3') switchPanel('openclaw');
 });
 
 // ── Init ──

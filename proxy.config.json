@@ -7,16 +7,26 @@
     {
       "name": "1",
       "bin": "/opt/homebrew/bin/claude",
+      "token": "",
+      "refreshToken": "",
+      "expiresAt": 1772627400000,
+      "note": "Account C (org 0b118cee) - from Claude Desktop session, no refresh token yet [disabled: no refresh token]"
+    },
+    {
+      "name": "2",
+      "bin": "/opt/homebrew/bin/claude",
       "token": "REDACTED",
       "refreshToken": "REDACTED",
-      "expiresAt": 1772555652212
+      "expiresAt": 1772621202887,
+      "note": "Account A (org 09966e51) - has refresh token via keychain"
     },
     {
       "name": "3",
       "bin": "/opt/homebrew/bin/claude",
       "token": "REDACTED",
       "refreshToken": "REDACTED",
-      "expiresAt": 1772538356889
+      "expiresAt": 1772621203094,
+      "note": "Account B (org d12bb4c8) - from claude-home-3, has refresh token"
     }
   ],
   "routing": {
@@ -25,7 +35,7 @@
     "healthCheckMs": 600000
   },
   "queue": {
-    "maxConcurrent": 20,
+    "maxConcurrent": 6,
     "maxQueueTotal": 200,
     "maxQueuePerSource": 50,
     "queueTimeoutMs": 300000,
@@ -82,7 +92,9 @@
     "name": "minimax-local"
   },
   "limits": {
-    "maxPromptChars": 50000
+    "maxPromptChars": 50000,
+    "maxPromptTokens": 190000,
+    "maxBodyBytes": 5000000
   },
   "systemReaper": {
     "intervalMs": 300000,
@@ -106,7 +118,6 @@
   },
   "portal": {
     "openclawPort": 8877,
-    "aimmPort": 3000,
     "healthPollMs": 5000,
     "iframeTimeoutMs": 8000
   }

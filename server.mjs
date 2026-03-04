@@ -105,7 +105,7 @@ const ANTHROPIC_API_VERSION = CONFIG.anthropic.apiVersion;
 
 const ANTHROPIC_MODEL_IDS = CONFIG.anthropic.models;
 
-// Token pool for API direct round-robin.
+// Token pool for API direct — least-utilization routing with round-robin tiebreaker.
 // Each token represents an independent OAuth credential with its own rate limits.
 // OAuth requires `anthropic-beta: oauth-2025-04-20` header to work with the raw API.
 const TOKEN_POOL = (() => {
@@ -127,9 +127,58 @@ const TOKEN_POOL = (() => {
   return tokens;
 })();
 let _tokenRrIndex = 0;
+/**
+ * Pick the best token: least-utilization first, round-robin as tiebreaker.
+ *
+ * Priority order:
+ *   1. Skip tokens in cooldown (429 backoff)
+ *   2. Among available tokens, pick the one with lowest 5h utilization %
+ *   3. Ties broken by round-robin index for fairness
+ *   4. If no utilization data yet (cold start), fall back to pure round-robin
+ */
 function getNextToken() {
-  const idx = _tokenRrIndex++ % TOKEN_POOL.length;
-  return TOKEN_POOL[idx];
+  if (TOKEN_POOL.length <= 1) return TOKEN_POOL[0];
+
+  const now = Date.now();
+  const rrBase = _tokenRrIndex++;
+
+  // Build candidates with utilization scores
+  const candidates = TOKEN_POOL.map((entry, idx) => {
+    const cooldownUntil = _tokenCooldowns.get(entry.name) || 0;
+    const inCooldown = cooldownUntil > now;
+    const rl = _unifiedRateLimits.get(entry.name);
+    // Use 5h utilization as primary score (0-1), fallback to 0 if unknown
+    const utilization = rl ? rl.h5Utilization : -1; // -1 = no data yet
+    return { entry, idx, inCooldown, utilization };
+  });
+
+  // Separate available from cooled-down
+  const available = candidates.filter(c => !c.inCooldown);
+  const pool = available.length > 0 ? available : candidates; // if all cooled, pick least cooldown
+
+  // Check if we have ANY utilization data
+  const hasData = pool.some(c => c.utilization >= 0);
+
+  if (!hasData) {
+    // Cold start: pure round-robin
+    const idx = rrBase % TOKEN_POOL.length;
+    return TOKEN_POOL[idx];
+  }
+
+  // Sort: lowest utilization first, round-robin index as tiebreaker
+  pool.sort((a, b) => {
+    // Tokens without data go last
+    if (a.utilization < 0 && b.utilization >= 0) return 1;
+    if (b.utilization < 0 && a.utilization >= 0) return -1;
+    // Lower utilization = better
+    const diff = a.utilization - b.utilization;
+    if (Math.abs(diff) > 0.001) return diff;
+    // Tiebreaker: distribute evenly via round-robin offset
+    return ((a.idx - rrBase % pool.length) + pool.length) % pool.length
+         - ((b.idx - rrBase % pool.length) + pool.length) % pool.length;
+  });
+
+  return pool[0].entry;
 }
 
 // Token cooldowns for Anthropic API direct (per OAuth token)
@@ -670,6 +719,10 @@ function identifySource(req) {
 // Max prompt characters (~50K chars ≈ ~12K tokens, leaves room for CLI agent's own tool calls).
 // Opus has 200K token context; we reserve most of it for the agent's multi-turn tool execution.
 const MAX_PROMPT_CHARS = CONFIG.limits.maxPromptChars;
+const MAX_BODY_BYTES = CONFIG.limits?.maxBodyBytes || 5_000_000;
+// Anthropic direct API context guard (token estimation, not exact)
+const MAX_PROMPT_TOKENS = CONFIG.limits?.maxPromptTokens || 190000;
+const APPROX_CHARS_PER_TOKEN = 3; // conservative to avoid 200k hard limit
 
 function extractPrompt(messages) {
   if (!Array.isArray(messages) || messages.length === 0) {
@@ -709,6 +762,73 @@ function extractPrompt(messages) {
   }
 
   return { prompt: kept.join("\n\n"), systemPrompt };
+}
+
+// --- Anthropic Direct API context guard (approximate token count) ---
+function contentCharLen(block) {
+  if (!block) return 0;
+  if (block.type === "text") return (block.text || "").length;
+  if (block.type === "tool_result") return String(block.content || "").length;
+  if (block.type === "tool_use") return (block.name || "").length + JSON.stringify(block.input || {}).length;
+  try { return JSON.stringify(block).length; } catch { return 0; }
+}
+
+function estimateAnthropicChars(system, messages) {
+  let chars = system ? system.length : 0;
+  for (const msg of messages || []) {
+    if (Array.isArray(msg.content)) {
+      for (const block of msg.content) chars += contentCharLen(block);
+    } else if (msg.content) {
+      chars += String(msg.content).length;
+    }
+  }
+  return chars;
+}
+
+function truncateContentBlock(block, budget) {
+  if (!block || budget <= 0) return null;
+  if (block.type === "text") return { ...block, text: (block.text || "").slice(-budget) };
+  if (block.type === "tool_result") return { ...block, content: String(block.content || "").slice(-budget) };
+  return null;
+}
+
+function trimAnthropicMessages(system, messages, maxTokens) {
+  const maxChars = Math.floor(maxTokens * APPROX_CHARS_PER_TOKEN);
+  let working = Array.isArray(messages) ? messages.map(m => ({ ...m, content: Array.isArray(m.content) ? [...m.content] : m.content })) : [];
+  let beforeChars = estimateAnthropicChars(system, working);
+  if (beforeChars <= maxChars) return { system, messages: working, truncated: false, beforeChars, afterChars: beforeChars };
+
+  while (working.length > 1 && estimateAnthropicChars(system, working) > maxChars) {
+    working.shift();
+  }
+
+  let afterChars = estimateAnthropicChars(system, working);
+  if (afterChars > maxChars && working.length === 1) {
+    const budget = Math.max(0, maxChars - (system ? system.length : 0));
+    const msg = working[0];
+    if (Array.isArray(msg.content)) {
+      const newContent = [];
+      let remaining = budget;
+      for (let i = msg.content.length - 1; i >= 0 && remaining > 0; i--) {
+        const block = msg.content[i];
+        const len = contentCharLen(block);
+        if (len <= remaining) {
+          newContent.unshift(block);
+          remaining -= len;
+        } else {
+          const truncated = truncateContentBlock(block, remaining);
+          if (truncated) newContent.unshift(truncated);
+          remaining = 0;
+        }
+      }
+      msg.content = newContent;
+    } else if (typeof msg.content === "string") {
+      msg.content = msg.content.slice(-budget);
+    }
+    afterChars = estimateAnthropicChars(system, working);
+  }
+
+  return { system, messages: working, truncated: true, beforeChars, afterChars };
 }
 
 function buildCliArgs(prompt, model, systemPrompt, stream) {
@@ -1119,14 +1239,18 @@ function streamFromAnthropicDirect(body, model, reqId, source, res, release, tok
   const anthropicModel = ANTHROPIC_MODEL_IDS[model] || ANTHROPIC_MODEL_IDS.sonnet;
   const anthropicTools = body.tools ? convertToolsToAnthropic(body.tools) : [];
   const { system, messages } = convertMessagesToAnthropic(body.messages);
+  const trimmed = trimAnthropicMessages(system, messages, MAX_PROMPT_TOKENS);
+  if (trimmed.truncated) {
+    console.log(`[${ts()}] CONTEXT_TRUNCATED reqId=${reqId} beforeChars=${trimmed.beforeChars} afterChars=${trimmed.afterChars}`);
+  }
 
   const requestBody = {
     model: anthropicModel,
     max_tokens: body.max_tokens || 16384,
     stream: true,
-    messages,
+    messages: trimmed.messages,
   };
-  if (system) requestBody.system = system;
+  if (trimmed.system) requestBody.system = trimmed.system;
   if (anthropicTools.length > 0) requestBody.tools = anthropicTools;
   if (body.tool_choice) {
     if (body.tool_choice === "auto") requestBody.tool_choice = { type: "auto" };
@@ -1316,13 +1440,17 @@ function callAnthropicDirect(body, model, reqId, source, tokenEntry) {
     const anthropicModel = ANTHROPIC_MODEL_IDS[model] || ANTHROPIC_MODEL_IDS.sonnet;
     const anthropicTools = body.tools ? convertToolsToAnthropic(body.tools) : [];
     const { system, messages } = convertMessagesToAnthropic(body.messages);
+    const trimmed = trimAnthropicMessages(system, messages, MAX_PROMPT_TOKENS);
+    if (trimmed.truncated) {
+      console.log(`[${ts()}] CONTEXT_TRUNCATED reqId=${reqId} beforeChars=${trimmed.beforeChars} afterChars=${trimmed.afterChars}`);
+    }
 
     const requestBody = {
       model: anthropicModel,
       max_tokens: body.max_tokens || 16384,
-      messages,
+      messages: trimmed.messages,
     };
-    if (system) requestBody.system = system;
+    if (trimmed.system) requestBody.system = trimmed.system;
     if (anthropicTools.length > 0) requestBody.tools = anthropicTools;
 
     const bodyStr = JSON.stringify(requestBody);
@@ -1538,12 +1666,17 @@ async function handleApiDirect(body, model, stream, source, req, res) {
 
 async function handleCompletions(req, res) {
   const source = identifySource(req);
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+
+  let rawBody;
+  try {
+    rawBody = await readBody(req, MAX_BODY_BYTES);
+  } catch (err) {
+    return sendJson(res, 413, { error: { message: err.message || "Payload too large" } });
+  }
 
   let body;
   try {
-    body = JSON.parse(Buffer.concat(chunks).toString());
+    body = JSON.parse(rawBody);
   } catch {
     return sendJson(res, 400, { error: { message: "Invalid JSON body" } });
   }
@@ -2066,7 +2199,7 @@ function handleMetrics(req, res) {
       version: CONFIG.dashboard.version,
       useCliAgents: USE_CLI_AGENTS,
       workerCount: _workerPool.length,
-      loadBalanceAlgorithm: "least-connections",
+      loadBalanceAlgorithm: "least-utilization",
       maxConcurrent: MAX_CONCURRENT,
       maxQueueTotal: MAX_QUEUE_TOTAL,
       maxQueuePerSource: MAX_QUEUE_PER_SOURCE,
@@ -2123,7 +2256,12 @@ function handleZombies(req, res) {
 }
 
 async function handleKillZombie(req, res) {
-  const body = await readBody(req);
+  let body;
+  try {
+    body = await readBody(req, MAX_BODY_BYTES);
+  } catch (err) {
+    return sendJson(res, 413, { error: { message: err.message || "Payload too large" } });
+  }
   let parsed;
   try {
     parsed = JSON.parse(body);
@@ -2190,11 +2328,21 @@ function sendJson(res, status, body, extraHeaders = {}) {
   res.end(JSON.stringify(body));
 }
 
-function readBody(req) {
-  return new Promise((resolve) => {
+function readBody(req, maxBytes = MAX_BODY_BYTES) {
+  return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on("data", (c) => chunks.push(c));
+    let size = 0;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > maxBytes) {
+        req.destroy();
+        const err = new Error(`Payload too large (>${maxBytes} bytes)`);
+        return reject(err);
+      }
+      chunks.push(c);
+    });
     req.on("end", () => resolve(Buffer.concat(chunks).toString()));
+    req.on("error", (err) => reject(err));
   });
 }
 

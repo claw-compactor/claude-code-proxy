@@ -262,6 +262,8 @@ export function loadConfig() {
   }
 
   const maxPromptChars = resolve(file, "limits.maxPromptChars", "MAX_PROMPT_CHARS", 50000, toInt);
+  const maxPromptTokens = resolve(file, "limits.maxPromptTokens", "MAX_PROMPT_TOKENS", 190000, toInt);
+  const maxBodyBytes = resolve(file, "limits.maxBodyBytes", "MAX_BODY_BYTES", 5_000_000, toInt);
 
   const systemReaper = {
     intervalMs: resolve(file, "systemReaper.intervalMs", "SYSTEM_REAPER_INTERVAL_MS", 300000, toInt),
@@ -288,7 +290,6 @@ export function loadConfig() {
 
   const portal = {
     openclawPort: resolve(file, "portal.openclawPort", null, 8877, toInt),
-    aimmPort: resolve(file, "portal.aimmPort", null, 3000, toInt),
     healthPollMs: resolve(file, "portal.healthPollMs", null, 5000, toInt),
     iframeTimeoutMs: resolve(file, "portal.iframeTimeoutMs", null, 8000, toInt),
   };
@@ -342,7 +343,7 @@ export function loadConfig() {
     rateLimits,
     anthropic: { apiBase: anthropicApiBase, apiVersion: anthropicApiVersion, models: anthropicModels },
     fallback,
-    limits: { maxPromptChars },
+    limits: { maxPromptChars, maxPromptTokens, maxBodyBytes },
     systemReaper,
     heartbeat,
     dashboard,
