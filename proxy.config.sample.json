@@ -25,7 +25,8 @@
     "primaryWorker": "1",
     "useCliAgents": false,
     "healthCheckMs": 600000,
-    "loadBalance": false
+    "loadBalance": false,
+    "allowExplicitTokenOverride": true
   },
   "sessionAffinity": {
     "ttlMs": 1800000
@@ -34,7 +35,9 @@
     "enabled": true,
     "systemPrefixChars": 1200,
     "minSystemPrefixChars": 200,
-    "keyMaxEntries": 5000
+    "keyMaxEntries": 5000,
+    "normalizeSystemPrefix": true,
+    "debounceWhitespace": true
   },
   "queue": {
     "maxConcurrent": 6,

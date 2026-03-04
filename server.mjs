@@ -70,6 +70,7 @@ const PRIMARY_WORKER = CONFIG.routing.primaryWorker;
 const HEALTH_CHECK_MS = CONFIG.routing.healthCheckMs;
 const USE_CLI_AGENTS = CONFIG.routing.useCliAgents;
 const LOAD_BALANCE_ENABLED = CONFIG.routing.loadBalance ?? false;
+const ALLOW_EXPLICIT_TOKEN_OVERRIDE = CONFIG.routing.allowExplicitTokenOverride ?? true;
 
 const _workerPool = CONFIG.workers;
 const _enabledWorkers = () => _workerPool.filter(w => !w.disabled);
@@ -792,6 +793,8 @@ const CACHE_CONTROL_ENABLED = CONFIG.cacheControl?.enabled ?? true;
 const CACHE_SYSTEM_PREFIX_CHARS = CONFIG.cacheControl?.systemPrefixChars ?? 1200;
 const CACHE_SYSTEM_MIN_PREFIX_CHARS = CONFIG.cacheControl?.minSystemPrefixChars ?? 200;
 const CACHE_KEY_MAX_ENTRIES = CONFIG.cacheControl?.keyMaxEntries ?? 5000;
+const CACHE_NORMALIZE_SYSTEM_PREFIX = CONFIG.cacheControl?.normalizeSystemPrefix ?? true;
+const CACHE_DEBOUNCE_WHITESPACE = CONFIG.cacheControl?.debounceWhitespace ?? true;
 
 function extractPrompt(messages) {
   if (!Array.isArray(messages) || messages.length === 0) {
@@ -835,7 +838,23 @@ function extractPrompt(messages) {
 
 // ── Cache-control helpers (Anthropic prompt caching) ──
 function normalizeText(text) {
-  return String(text || "").replace(/\r\n/g, "\n").trim();
+  const raw = String(text || "");
+  if (!CACHE_NORMALIZE_SYSTEM_PREFIX) return raw;
+  let normalized = raw.replace(/\r\n/g, "\n");
+  if (CACHE_DEBOUNCE_WHITESPACE) {
+    normalized = normalized
+      .replace(/[ \t]+/g, " ")
+      .replace(/\n[ \t]+/g, "\n")
+      .replace(/\n{3,}/g, "\n\n");
+  }
+  return normalized.trim();
+}
+
+function normalizeTextForKey(text) {
+  const base = normalizeText(text);
+  if (!CACHE_NORMALIZE_SYSTEM_PREFIX) return base;
+  if (!CACHE_DEBOUNCE_WHITESPACE) return base;
+  return base.replace(/\s+/g, " ").trim();
 }
 function stableStringify(obj) {
   if (obj === null || typeof obj !== "object") return JSON.stringify(obj);
@@ -848,14 +867,16 @@ function hashString(str) {
 }
 function splitSystemForCache(systemText) {
   const normalized = normalizeText(systemText);
-  if (!normalized) return { normalized: "", prefix: "", suffix: "", cacheable: false };
+  const keyNormalized = normalizeTextForKey(systemText);
+  if (!normalized) return { normalized: "", prefix: "", suffix: "", cacheable: false, keyPrefix: "" };
   const prefixLen = Math.min(CACHE_SYSTEM_PREFIX_CHARS, normalized.length);
   if (prefixLen < CACHE_SYSTEM_MIN_PREFIX_CHARS) {
-    return { normalized, prefix: "", suffix: normalized, cacheable: false };
+    return { normalized, prefix: "", suffix: normalized, cacheable: false, keyPrefix: "" };
   }
   const prefix = normalized.slice(0, prefixLen);
   const suffix = normalized.slice(prefixLen);
-  return { normalized, prefix, suffix, cacheable: true };
+  const keyPrefix = keyNormalized ? keyNormalized.slice(0, Math.min(prefixLen, keyNormalized.length)) : "";
+  return { normalized, prefix, suffix, cacheable: true, keyPrefix };
 }
 function buildCacheContext({ body, model, source, req, applyCacheControl }) {
   const tenant = req?.headers?.["x-tenant-id"] || req?.headers?.["x-openclaw-tenant"] || source || "unknown";
@@ -865,10 +886,10 @@ function buildCacheContext({ body, model, source, req, applyCacheControl }) {
     if (!systemMsg) return "";
     return typeof systemMsg.content === "string" ? systemMsg.content : JSON.stringify(systemMsg.content);
   })();
-  const { normalized, prefix, suffix, cacheable } = splitSystemForCache(systemPrompt);
+  const { normalized, prefix, suffix, cacheable, keyPrefix } = splitSystemForCache(systemPrompt);
   const toolsSchema = body?.tools ? stableStringify(body.tools) : "";
   const toolsHash = toolsSchema ? hashString(toolsSchema) : "none";
-  const systemPrefixHash = prefix ? hashString(prefix) : "none";
+  const systemPrefixHash = keyPrefix ? hashString(keyPrefix) : "none";
   const cacheKey = `t:${tenant}|s:${sessionId || "none"}|m:${model}|sp:${systemPrefixHash}|th:${toolsHash}`;
   const candidateCount = prefix ? 1 : 0;
   const appliedCount = applyCacheControl && CACHE_CONTROL_ENABLED && cacheable ? 1 : 0;
@@ -894,6 +915,19 @@ function buildAnthropicSystemBlocks(systemText, cacheCtx) {
     return blocks;
   }
   return [{ type: "text", text: normalized }];
+}
+
+function buildUsage({ inputTokens = 0, outputTokens = 0, cacheCreation = 0, cacheRead = 0 } = {}) {
+  const totalInput = inputTokens + cacheCreation + cacheRead;
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    cache_creation_input_tokens: cacheCreation,
+    cache_read_input_tokens: cacheRead,
+    prompt_tokens: totalInput,
+    completion_tokens: outputTokens,
+    total_tokens: totalInput + outputTokens,
+  };
 }
 
 // --- Anthropic Direct API context guard (approximate token count) ---
@@ -1684,14 +1718,15 @@ function callAnthropicDirect(body, model, reqId, source, tokenEntry, cacheCtx) {
               toolCalls.push({ id: block.id, name: block.name, arguments: JSON.stringify(block.input) });
             }
           }
+          const rawUsage = result.usage || {};
+          const inputTokens = rawUsage.input_tokens || 0;
+          const outputTokens = rawUsage.output_tokens || 0;
+          const cacheCreation = rawUsage.cache_creation_input_tokens || 0;
+          const cacheRead = rawUsage.cache_read_input_tokens || 0;
           resolve({
             content: textContent || null,
             toolCalls,
-            usage: {
-              prompt_tokens: result.usage?.input_tokens || 0,
-              completion_tokens: result.usage?.output_tokens || 0,
-              total_tokens: (result.usage?.input_tokens || 0) + (result.usage?.output_tokens || 0),
-            },
+            usage: buildUsage({ inputTokens, outputTokens, cacheCreation, cacheRead }),
             stopReason: result.stop_reason,
           });
         } catch (err) {
@@ -1760,7 +1795,7 @@ async function handleApiDirect(body, model, stream, source, req, res) {
 
   const requestedTokenRaw = req.headers["x-token-name"] ?? body.tokenName;
   let tokenEntry = null;
-  if (requestedTokenRaw !== undefined && requestedTokenRaw !== null) {
+  if (ALLOW_EXPLICIT_TOKEN_OVERRIDE && requestedTokenRaw !== undefined && requestedTokenRaw !== null) {
     const requestedTokenName = String(requestedTokenRaw).trim();
     if (requestedTokenName) {
       tokenEntry = TOKEN_POOL.find(t => t.name === requestedTokenName) || null;
@@ -2289,7 +2324,10 @@ ${fbResult}` : notice;
         reqId, mode: "sync", model, source,
         inputTokens: syncInputTokens, outputTokens: syncOutputTokens,
       });
-      sendJson(res, 200, completionResponse(reqId, result, model));
+      sendJson(res, 200, completionResponse(reqId, result, model, buildUsage({
+        inputTokens: syncInputTokens,
+        outputTokens: syncOutputTokens,
+      })));
     } catch (err) {
       if (err.isRateLimit) {
         const allLimited = getAllLimitedStatus();

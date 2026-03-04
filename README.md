@@ -132,6 +132,13 @@ curl -X POST http://localhost:8403/v1/chat/completions \
   }'
 ```
 
+### Usage Fields
+
+`/v1/chat/completions` responses include Anthropic cache usage passthrough:
+- `input_tokens`, `output_tokens`
+- `cache_creation_input_tokens`, `cache_read_input_tokens`
+- legacy-compatible fields: `prompt_tokens`, `completion_tokens`, `total_tokens`
+
 ### Explicit Token Routing (worker3)
 
 Optionally route a request to a specific worker by name:
@@ -140,6 +147,8 @@ Optionally route a request to a specific worker by name:
 - Body: `{ "tokenName": "worker3" }`
 
 If omitted, the proxy keeps the existing least-utilization routing behavior.
+
+This override can be disabled via `routing.allowExplicitTokenOverride` (default: true).
 
 ```bash
 curl -X POST http://localhost:8403/v1/chat/completions \
@@ -182,6 +191,10 @@ Anthropic prompt cache optimization:
 - `enabled`: Toggle cache_control injection
 - `systemPrefixChars`: Stable prefix length to cache
 - `minSystemPrefixChars`: Minimum prefix to bother caching
+- `normalizeSystemPrefix`: Normalize system prefix (trim, normalize newlines)
+- `debounceWhitespace`: Collapse whitespace noise for stable cache keys
+
+See `docs/cache-optimization.md` for hit-rate tactics and anti-patterns.
 
 ### `queue`
 Fair queuing with per-source isolation:

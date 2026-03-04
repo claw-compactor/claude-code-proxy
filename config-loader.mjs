@@ -197,6 +197,7 @@ export function loadConfig() {
   const primaryWorker = resolve(file, "routing.primaryWorker", "PRIMARY_WORKER", "1");
   const useCliAgents = resolve(file, "routing.useCliAgents", "USE_CLI_AGENTS", true, toBool);
   const healthCheckMs = resolve(file, "routing.healthCheckMs", "HEALTH_CHECK_MS", 600000, toInt);
+  const allowExplicitTokenOverride = resolve(file, "routing.allowExplicitTokenOverride", "ALLOW_EXPLICIT_TOKEN_OVERRIDE", true, toBool);
 
   const maxConcurrent = resolve(file, "queue.maxConcurrent", "MAX_CONCURRENT", 20, toInt);
   const maxQueueTotal = resolve(file, "queue.maxQueueTotal", "MAX_QUEUE_TOTAL", 200, toInt);
@@ -233,6 +234,8 @@ export function loadConfig() {
     systemPrefixChars: resolve(file, "cacheControl.systemPrefixChars", "CACHE_CONTROL_SYSTEM_PREFIX_CHARS", 1200, toInt),
     minSystemPrefixChars: resolve(file, "cacheControl.minSystemPrefixChars", "CACHE_CONTROL_MIN_SYSTEM_PREFIX_CHARS", 200, toInt),
     keyMaxEntries: resolve(file, "cacheControl.keyMaxEntries", "CACHE_CONTROL_KEY_MAX_ENTRIES", 5000, toInt),
+    normalizeSystemPrefix: resolve(file, "cacheControl.normalizeSystemPrefix", "CACHE_CONTROL_NORMALIZE_SYSTEM_PREFIX", true, toBool),
+    debounceWhitespace: resolve(file, "cacheControl.debounceWhitespace", "CACHE_CONTROL_DEBOUNCE_WHITESPACE", true, toBool),
   };
 
   const rateLimits = get(file, "rateLimits") || {
@@ -336,7 +339,7 @@ export function loadConfig() {
   const config = {
     server: { port, authToken },
     workers: normalizedWorkers,
-    routing: { primaryWorker, useCliAgents, healthCheckMs },
+    routing: { primaryWorker, useCliAgents, healthCheckMs, allowExplicitTokenOverride },
     queue: {
       maxConcurrent,
       maxQueueTotal,
