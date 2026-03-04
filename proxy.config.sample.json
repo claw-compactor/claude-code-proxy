@@ -129,5 +129,12 @@
     "openclawPort": 8877,
     "healthPollMs": 5000,
     "iframeTimeoutMs": 8000
+  },
+  "autoHeal": {
+    "enabled": true,
+    "maxRetriesPerRequest": 1,
+    "cooldownMs": 15000,
+    "circuitFailThreshold": 3,
+    "circuitOpenMs": 60000
   }
 }

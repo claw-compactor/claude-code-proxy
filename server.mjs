@@ -2681,6 +2681,7 @@ function handleMetrics(req, res) {
     auto_heal_fail: autoHealStats.fail,
     last_heal_at: autoHealStats.lastHealAt,
     heal_reason: autoHealStats.lastHealReason,
+    circuit_state: autoHeal.getWorkerState(PRIMARY_WORKER).circuitState,
     activeConnections: Object.fromEntries(_activeConns),
     systemReaper: systemReaper.getStats(),
     unifiedRateLimits: getUnifiedRateLimits(),

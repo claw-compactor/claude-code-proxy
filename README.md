@@ -201,6 +201,12 @@ Anthropic prompt cache optimization:
 
 See `docs/cache-optimization.md` for hit-rate tactics and anti-patterns.
 
+### Auto-Heal (CLI auth recovery)
+
+The proxy can auto-heal worker auth failures by refreshing OAuth tokens, cooling down, and retrying on the same worker before failing over.
+
+See `docs/auto-heal.md` for trigger conditions, circuit breaker rules, and metrics.
+
 ### `sessionStats`
 Per-session cache analytics:
 - `ttlMs`: Retain per-session events for this long (default: 24h)

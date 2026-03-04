@@ -310,6 +310,14 @@ export function loadConfig() {
     iframeTimeoutMs: resolve(file, "portal.iframeTimeoutMs", null, 8000, toInt),
   };
 
+  const autoHeal = {
+    enabled: resolve(file, "autoHeal.enabled", "AUTO_HEAL_ENABLED", true, toBool),
+    maxRetriesPerRequest: resolve(file, "autoHeal.maxRetriesPerRequest", "AUTO_HEAL_MAX_RETRIES_PER_REQUEST", 1, toInt),
+    cooldownMs: resolve(file, "autoHeal.cooldownMs", "AUTO_HEAL_COOLDOWN_MS", 15_000, toInt),
+    circuitFailThreshold: resolve(file, "autoHeal.circuitFailThreshold", "AUTO_HEAL_CIRCUIT_FAIL_THRESHOLD", 3, toInt),
+    circuitOpenMs: resolve(file, "autoHeal.circuitOpenMs", "AUTO_HEAL_CIRCUIT_OPEN_MS", 60_000, toInt),
+  };
+
   // --- Validation ---
 
   if (!Array.isArray(workers) || workers.length === 0) {
@@ -367,6 +375,7 @@ export function loadConfig() {
     heartbeat,
     dashboard,
     portal,
+    autoHeal,
   };
 
   // Deep freeze to prevent accidental mutation
