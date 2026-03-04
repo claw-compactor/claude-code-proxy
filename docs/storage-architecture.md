@@ -61,3 +61,18 @@
 - Redis 不可用：日志出现 `[Redis] Connection failed`，系统自动转入本地 fallback
 - 窗口统计缺失：检查 Redis ZSET `cache:events` / `sessions:events:*` 是否存在
 - 需要清理：可手动删除 `analytics:*` / `cache:*` / `sessions:*` 键后重启
+
+## 实测结果（2026-03-04）
+
+- **多 worker + 多 session 写入**：用 worker2/3 发送 3 个 session（sess-a/b/c），`/metrics` 的 sessions 中可见三条记录，且 `requests1h=1`。
+- **窗口统计变化**：
+  - 初始：`cacheWindows` 5m/15m/1h/24h = `requests=4, hits=0`
+  - 追加一次请求后：5m/15m/1h/24h = `requests=5, hits=1`（sess-a 出现 1 次 hit）
+- **重启持久性**：连续重启两次后，`cacheWindows` 仍为 `requests=5, hits=1`，1h 窗口未丢。
+- **Redis 故障 fallback**：停 Redis 后重启 proxy，日志出现：
+  - `[Redis] Connection failed: Connection is closed. — running in memory-only mode`
+  - `[TokenTracker] Loaded from file ...`
+  - `[MetricsStore] Loaded ... from file`
+- **Redis 恢复**：恢复 Redis 后重启 proxy，日志出现：
+  - `[Redis] Connected and ready`
+  - `[Storage] Migrated local analytics snapshot to Redis`

@@ -670,6 +670,7 @@ try {
 }
 
 // Unified storage backend (Redis-first, local fallback)
+const CACHE_KEY_MAX_ENTRIES = CONFIG.cacheControl?.keyMaxEntries ?? 5000;
 storageBackend = createStorageBackend({
   redis,
   backend: CONFIG.storage?.backend || "redis",
@@ -896,7 +897,6 @@ const APPROX_CHARS_PER_TOKEN = 3; // conservative to avoid 200k hard limit
 const CACHE_CONTROL_ENABLED = CONFIG.cacheControl?.enabled ?? true;
 const CACHE_SYSTEM_PREFIX_CHARS = CONFIG.cacheControl?.systemPrefixChars ?? 1200;
 const CACHE_SYSTEM_MIN_PREFIX_CHARS = CONFIG.cacheControl?.minSystemPrefixChars ?? 200;
-const CACHE_KEY_MAX_ENTRIES = CONFIG.cacheControl?.keyMaxEntries ?? 5000;
 const CACHE_NORMALIZE_SYSTEM_PREFIX = CONFIG.cacheControl?.normalizeSystemPrefix ?? true;
 const CACHE_DEBOUNCE_WHITESPACE = CONFIG.cacheControl?.debounceWhitespace ?? true;
 const CACHE_SESSION_SCOPE = CONFIG.cacheControl?.sessionScope ?? "x-session-id"; // "x-session-id" | "none"
