@@ -15,16 +15,16 @@
     {
       "name": "2",
       "bin": "/opt/homebrew/bin/claude",
-      "token": "REDACTED",
-      "refreshToken": "REDACTED",
+      "token": "",
+      "refreshToken": "",
       "expiresAt": 1772621202887,
       "note": "Account A (org 09966e51) - has refresh token via keychain"
     },
     {
       "name": "3",
       "bin": "/opt/homebrew/bin/claude",
-      "token": "REDACTED",
-      "refreshToken": "REDACTED",
+      "token": "",
+      "refreshToken": "",
       "expiresAt": 1772621203094,
       "note": "Account B (org d12bb4c8) - from claude-home-3, has refresh token"
     }
