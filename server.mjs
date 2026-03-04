@@ -34,12 +34,17 @@ import { createMetricsStore } from "./metrics-store.mjs";
 import { createRateLimiter } from "./rate-limiter.mjs";
 import { createRedisClient } from "./redis-client.mjs";
 import { createSessionAffinity } from "./session-affinity.mjs";
-import { createSessionCacheStats } from "./session-cache-stats.mjs";
 import { createSystemReaper } from "./system-reaper.mjs";
 import { createWarmPool } from "./worker-pool.mjs";
 import { loadConfig } from "./config-loader.mjs";
 import { createTokenRefresher } from "./token-refresh.mjs";
 import { createAutoHealManager, classifyCliError } from "./auto-heal.mjs";
+import {
+  createStorageBackend,
+  createCacheStatsStore,
+  createSessionStatsStore,
+  createWorkerStatsStore,
+} from "./storage-backend.mjs";
 import {
   sseChunk, sseToolCallStartChunk, sseToolCallDeltaChunk, sseFinishChunk,
   completionResponse, completionResponseWithTools,
@@ -272,9 +277,27 @@ const workerStats = {
   // Recent error log (ring buffer, last 100)
   recentErrors: [],
 };
+
+let storageBackend = null;
+let cacheStatsStore = null;
+let sessionStatsStore = null;
+let workerStatsStore = null;
+let workerStatsSaveTimer = null;
+
+function scheduleWorkerStatsPersist() {
+  if (!workerStatsStore) return;
+  if (workerStatsSaveTimer) return;
+  workerStatsSaveTimer = setTimeout(() => {
+    workerStatsSaveTimer = null;
+    workerStatsStore.save(workerStats);
+  }, 1000);
+  if (workerStatsSaveTimer.unref) workerStatsSaveTimer.unref();
+}
+
 function recordWorkerRequest(workerName) {
   const w = workerStats.traffic[workerName];
   if (w) { w.requests++; w.lastReqAt = Date.now(); }
+  scheduleWorkerStatsPersist();
 }
 function recordWorkerError(workerName, category, detail) {
   const w = workerStats.traffic[workerName];
@@ -283,6 +306,7 @@ function recordWorkerError(workerName, category, detail) {
   else workerStats.errors.other++;
   workerStats.recentErrors.push({ ts: Date.now(), worker: workerName, category, detail: (detail || "").slice(0, 200) });
   if (workerStats.recentErrors.length > 100) workerStats.recentErrors.shift();
+  scheduleWorkerStatsPersist();
 }
 
 function computeWorkerWindowStats(windowMs = 60 * 60 * 1000) {
@@ -328,71 +352,33 @@ function seedWorkerStatsFromHistory() {
 }
 
 // Cache stats: prompt caching eligibility + TTFT comparison
-const cacheStats = {
-  candidates: 0,
-  applied: 0,
-  hits: 0,
-  misses: 0,
-  lastHitAt: null,
-  ttftCachedAvg: null,
-  ttftUncachedAvg: null,
-  recentKeys: new Map(),
-};
 function recordCacheCandidate(count) {
-  if (count > 0) cacheStats.candidates += count;
+  cacheStatsStore?.recordCacheCandidate(count);
 }
 function recordCacheApplied(count) {
-  if (count > 0) cacheStats.applied += count;
+  cacheStatsStore?.recordCacheApplied(count);
 }
 function recordCacheKey(cacheKeyHash) {
-  if (!cacheKeyHash) return { seen: false };
-  const now = Date.now();
-  const seen = cacheStats.recentKeys.has(cacheKeyHash);
-  cacheStats.recentKeys.set(cacheKeyHash, now);
-  if (cacheStats.recentKeys.size > CACHE_KEY_MAX_ENTRIES) {
-    // Drop oldest entry to cap memory
-    let oldestKey = null;
-    let oldestAt = Infinity;
-    for (const [key, tsValue] of cacheStats.recentKeys) {
-      if (tsValue < oldestAt) { oldestAt = tsValue; oldestKey = key; }
-    }
-    if (oldestKey) cacheStats.recentKeys.delete(oldestKey);
-  }
-  if (seen) {
-    cacheStats.hits++;
-    cacheStats.lastHitAt = now;
-  } else {
-    cacheStats.misses++;
-  }
-  return { seen };
+  if (!cacheStatsStore) return { seen: false };
+  return cacheStatsStore.recordCacheKey(cacheKeyHash);
 }
 function recordCacheTtft(ttftMs, cached) {
-  const key = cached ? "ttftCachedAvg" : "ttftUncachedAvg";
-  const prev = cacheStats[key];
-  cacheStats[key] = prev == null ? ttftMs : Math.round(prev * 0.8 + ttftMs * 0.2);
+  cacheStatsStore?.recordCacheTtft(ttftMs, cached);
 }
 function getCacheStats() {
-  const total = cacheStats.hits + cacheStats.misses;
-  return {
-    candidates: cacheStats.candidates,
-    applied: cacheStats.applied,
-    hits: cacheStats.hits,
-    misses: cacheStats.misses,
-    hitRate: total > 0 ? (cacheStats.hits / total * 100).toFixed(1) + "%" : "0%",
-    lastHitAt: cacheStats.lastHitAt,
-    lastHitIso: cacheStats.lastHitAt ? new Date(cacheStats.lastHitAt).toISOString() : null,
-    ttftCachedAvg: cacheStats.ttftCachedAvg,
-    ttftUncachedAvg: cacheStats.ttftUncachedAvg,
-    recentKeys: cacheStats.recentKeys.size,
+  return cacheStatsStore?.getCacheStats?.() || {
+    candidates: 0,
+    applied: 0,
+    hits: 0,
+    misses: 0,
+    hitRate: "0%",
+    lastHitAt: null,
+    lastHitIso: null,
+    ttftCachedAvg: null,
+    ttftUncachedAvg: null,
+    recentKeys: 0,
   };
 }
-
-// Session cache stats — per session hit/miss tracking
-const sessionCacheStats = createSessionCacheStats({
-  ttlMs: CONFIG.sessionStats?.ttlMs,
-  cleanupIntervalMs: CONFIG.sessionStats?.cleanupIntervalMs,
-  topN: CONFIG.sessionStats?.topN,
-});
 
 function getSessionIdForStats(req) {
   return req?.headers?.["x-session-id"] || "";
@@ -681,6 +667,42 @@ try {
 } catch (err) {
   console.warn(`[Redis] Connection failed: ${err.message} — running in memory-only mode`);
   redis = null;
+}
+
+// Unified storage backend (Redis-first, local fallback)
+storageBackend = createStorageBackend({
+  redis,
+  backend: CONFIG.storage?.backend || "redis",
+});
+await storageBackend.ready;
+cacheStatsStore = createCacheStatsStore({
+  storage: storageBackend,
+  maxRecentKeys: CACHE_KEY_MAX_ENTRIES,
+});
+await cacheStatsStore.load();
+workerStatsStore = createWorkerStatsStore({ storage: storageBackend });
+await workerStatsStore.load();
+sessionStatsStore = createSessionStatsStore({
+  storage: storageBackend,
+  ttlMs: CONFIG.sessionStats?.ttlMs,
+  cleanupIntervalMs: CONFIG.sessionStats?.cleanupIntervalMs,
+  topN: CONFIG.sessionStats?.topN,
+});
+
+// Seed worker stats from storage snapshot if available
+const storedWorkerStats = workerStatsStore.get();
+if (storedWorkerStats?.traffic) {
+  for (const [name, stats] of Object.entries(storedWorkerStats.traffic)) {
+    if (!workerStats.traffic[name]) {
+      workerStats.traffic[name] = { requests: 0, errors: 0, lastReqAt: null };
+    }
+    workerStats.traffic[name].requests = stats.requests || stats.r || 0;
+    workerStats.traffic[name].errors = stats.errors || stats.e || 0;
+    workerStats.traffic[name].lastReqAt = stats.lastReqAt || stats.last || null;
+  }
+}
+if (storedWorkerStats?.errors) {
+  workerStats.errors = { ...workerStats.errors, ...storedWorkerStats.errors };
 }
 
 const SOURCE_CONCURRENCY_LIMITS = CONFIG.queue.sourceConcurrencyLimits;
@@ -1905,7 +1927,7 @@ async function handleApiDirect(body, model, stream, source, req, res) {
   recordCacheCandidate(cacheCtx.candidateCount);
   recordCacheApplied(cacheCtx.appliedCount);
   const cacheSeen = recordCacheKey(cacheCtx.cacheKeyHash);
-  sessionCacheStats.record(getSessionIdForStats(req), cacheSeen.seen);
+  sessionStatsStore?.record(getSessionIdForStats(req), cacheSeen.seen).catch?.(() => {});
   console.log(
     `[${ts()}] CACHE_CTX reqId=${reqId} src=${source} tenant=${cacheCtx.tenant} model=${model} ` +
     `candidate=${cacheCtx.candidateCount} applied=${cacheCtx.appliedCount} ` +
@@ -2071,7 +2093,7 @@ async function handleCompletions(req, res) {
   recordCacheCandidate(cacheCtx.candidateCount);
   recordCacheApplied(cacheCtx.appliedCount);
   const cacheSeen = recordCacheKey(cacheCtx.cacheKeyHash);
-  sessionCacheStats.record(getSessionIdForStats(req), cacheSeen.seen);
+  sessionStatsStore?.record(getSessionIdForStats(req), cacheSeen.seen).catch?.(() => {});
 
   const priority = MODEL_PRIORITY[model] || "normal";
   // Estimated tokens for rate-limiter: use a small fixed cap.
@@ -2601,7 +2623,7 @@ function handleHealth(req, res) {
   });
 }
 
-function handleMetrics(req, res) {
+async function handleMetrics(req, res) {
   const qs = queue.getStats();
   const rs = registry.getStats();
   const url = new URL(req.url, `http://0.0.0.0:${PORT}`);
@@ -2612,7 +2634,10 @@ function handleMetrics(req, res) {
     ? Math.max(1, Math.min(sessionLimitRaw, 500))
     : defaultSessionLimit;
   const sessionOffset = Number.isFinite(sessionOffsetRaw) ? Math.max(0, sessionOffsetRaw) : 0;
-  const sessions = sessionCacheStats.getStats({ limit: sessionLimit, offset: sessionOffset });
+  const sessions = sessionStatsStore
+    ? await sessionStatsStore.getStats({ limit: sessionLimit, offset: sessionOffset })
+    : { total: 0, limit: sessionLimit, offset: sessionOffset, retentionMs: 0, items: [] };
+  const cacheWindows = cacheStatsStore ? await cacheStatsStore.getWindowStats() : null;
   const workers = _workerPool.map((w) => {
     const h = _workerHealth.get(w.name);
     const until = h.limitedUntil || null;
@@ -2646,6 +2671,7 @@ function handleMetrics(req, res) {
     queue: qs,
     processes: rs,
     sessions,
+    cacheWindows,
     config: {
       version: CONFIG.dashboard.version,
       useCliAgents: USE_CLI_AGENTS,
@@ -2866,9 +2892,9 @@ const server = createServer(async (req, res) => {
     } else if (url.pathname === "/health" && req.method === "GET") {
       handleHealth(req, res);
     } else if (url.pathname === "/metrics" && req.method === "GET") {
-      handleMetrics(req, res);
+      await handleMetrics(req, res);
     } else if (url.pathname === "/rate-limits" && req.method === "GET") {
-      handleMetrics(req, res); // backward compat
+      await handleMetrics(req, res); // backward compat
     } else if (url.pathname === "/zombies" && req.method === "GET") {
       handleZombies(req, res);
     } else if (url.pathname === "/zombies" && req.method === "POST") {

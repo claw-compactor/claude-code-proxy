@@ -45,6 +45,9 @@
     "debounceWhitespace": true,
     "sessionScope": "x-session-id"
   },
+  "storage": {
+    "backend": "redis"
+  },
   "queue": {
     "maxConcurrent": 6,
     "maxQueueTotal": 200,

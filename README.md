@@ -64,7 +64,7 @@ Clients (OpenAI format)
 ### Prerequisites
 
 - Node.js 20+
-- Redis (for metrics persistence; proxy works without it but loses history on restart)
+- Redis (recommended for analytics persistence; proxy falls back to local backup when unavailable)
 - One or more Claude Max subscription accounts with OAuth tokens
 
 ### Install
@@ -111,7 +111,7 @@ npm run dev
 | `/portal` | GET | Portal page with embedded dashboard |
 | `/events` | GET | SSE stream for live dashboard updates |
 
-`/metrics` includes `workerStats` (realtime totals) and `workerStatsWindow` (last 1h deltas) so the dashboard can compare workers even after restarts.
+`/metrics` includes `workerStats` (realtime totals) and `workerStatsWindow` (last 1h deltas) so the dashboard can compare workers even after restarts. Cache/session analytics are persisted in Redis (with a local JSON fallback) for restart safety.
 
 ### Supported Models
 
@@ -200,6 +200,10 @@ Anthropic prompt cache optimization:
 - `sessionScope`: `x-session-id` (default) or `none` for cross-session cache sharing
 
 See `docs/cache-optimization.md` for hit-rate tactics and anti-patterns.
+
+### `storage`
+Unified analytics persistence:
+- `backend`: `redis` (default) or `local` for file-only fallback
 
 ### Auto-Heal (CLI auth recovery)
 
