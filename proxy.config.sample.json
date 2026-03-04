@@ -1,7 +1,7 @@
 {
   "server": {
     "port": 8403,
-    "authToken": "local-proxy"
+    "authToken": ""
   },
   "workers": [
     {
@@ -9,30 +9,23 @@
       "bin": "/opt/homebrew/bin/claude",
       "token": "",
       "refreshToken": "",
-      "expiresAt": 1772627400000,
-      "note": "Account C (org 0b118cee) - from Claude Desktop session, no refresh token yet [disabled: no refresh token]"
+      "expiresAt": 0,
+      "note": "Worker 1 — set token via OAuth flow"
     },
     {
       "name": "2",
       "bin": "/opt/homebrew/bin/claude",
       "token": "",
       "refreshToken": "",
-      "expiresAt": 1772621202887,
-      "note": "Account A (org 09966e51) - has refresh token via keychain"
-    },
-    {
-      "name": "3",
-      "bin": "/opt/homebrew/bin/claude",
-      "token": "",
-      "refreshToken": "",
-      "expiresAt": 1772621203094,
-      "note": "Account B (org d12bb4c8) - from claude-home-3, has refresh token"
+      "expiresAt": 0,
+      "note": "Worker 2 — set token via OAuth flow"
     }
   ],
   "routing": {
-    "primaryWorker": "3",
+    "primaryWorker": "1",
     "useCliAgents": false,
-    "healthCheckMs": 600000
+    "healthCheckMs": 600000,
+    "loadBalance": false
   },
   "sessionAffinity": {
     "ttlMs": 1800000
@@ -48,9 +41,7 @@
     "maxQueueTotal": 200,
     "maxQueuePerSource": 50,
     "queueTimeoutMs": 300000,
-    "sourceConcurrencyLimits": {
-      "batch-labeler": 15
-    },
+    "sourceConcurrencyLimits": {},
     "defaultSourceConcurrency": 0
   },
   "timeouts": {
@@ -95,10 +86,10 @@
     }
   },
   "fallback": {
-    "baseUrl": "http://172.28.216.81:8080/v1",
-    "apiKey": "none",
-    "model": "MiniMax-M2.5-Q8_0-00001-of-00006.gguf",
-    "name": "minimax-local"
+    "baseUrl": "",
+    "apiKey": "",
+    "model": "",
+    "name": ""
   },
   "limits": {
     "maxPromptChars": 50000,

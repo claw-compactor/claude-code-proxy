@@ -1,14 +1,40 @@
+# Dependencies
 node_modules/
+
+# Runtime logs
 proxy.log
 proxy.err
+*.log
+
+# Runtime data
 data/
-*.json.bak
-task-tracker.json
-__pycache__/
-*.pyc
-.env*
+token_labels.json
+
+# Config with real tokens (use proxy.config.sample.json as template)
 proxy.config.json
 proxy.config.json.tmp
-proxy.config.json.bak.*
-token_labels.json
+proxy.config.json.bak*
+*.json.bak
+
+# Environment / secrets
+.env*
+secrets.local
+
+# Python artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Unrelated scripts
 shutdown_aimm_bots.sh
+task-tracker.json
