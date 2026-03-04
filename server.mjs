@@ -39,6 +39,7 @@ import { createSystemReaper } from "./system-reaper.mjs";
 import { createWarmPool } from "./worker-pool.mjs";
 import { loadConfig } from "./config-loader.mjs";
 import { createTokenRefresher } from "./token-refresh.mjs";
+import { createAutoHealManager, classifyCliError } from "./auto-heal.mjs";
 import {
   sseChunk, sseToolCallStartChunk, sseToolCallDeltaChunk, sseFinishChunk,
   completionResponse, completionResponseWithTools,
@@ -282,6 +283,48 @@ function recordWorkerError(workerName, category, detail) {
   else workerStats.errors.other++;
   workerStats.recentErrors.push({ ts: Date.now(), worker: workerName, category, detail: (detail || "").slice(0, 200) });
   if (workerStats.recentErrors.length > 100) workerStats.recentErrors.shift();
+}
+
+function computeWorkerWindowStats(windowMs = 60 * 60 * 1000) {
+  const cutoff = Date.now() - windowMs;
+  const raw = metricsStore.getRawBuffer().filter((e) => (e.ts || 0) * 1000 >= cutoff && e.workers);
+  if (raw.length === 0) return { windowMs, traffic: {}, samples: 0 };
+
+  const sorted = raw.sort((a, b) => a.ts - b.ts);
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1];
+  const names = new Set([
+    ...Object.keys(first.workers || {}),
+    ...Object.keys(last.workers || {}),
+  ]);
+  const traffic = {};
+  for (const name of names) {
+    const f = first.workers?.[name] || { r: 0, e: 0 };
+    const l = last.workers?.[name] || { r: 0, e: 0 };
+    const reqDelta = l.r - f.r;
+    const errDelta = l.e - f.e;
+    traffic[name] = {
+      requests: reqDelta >= 0 ? reqDelta : l.r || 0,
+      errors: errDelta >= 0 ? errDelta : l.e || 0,
+    };
+  }
+  return { windowMs, traffic, samples: sorted.length, startTs: first.ts, endTs: last.ts };
+}
+
+function seedWorkerStatsFromHistory() {
+  const raw = metricsStore.getRawBuffer();
+  if (!raw || raw.length === 0) return false;
+  const last = raw[raw.length - 1];
+  if (!last?.workers) return false;
+  for (const [name, stats] of Object.entries(last.workers)) {
+    if (!workerStats.traffic[name]) {
+      workerStats.traffic[name] = { requests: 0, errors: 0, lastReqAt: null };
+    }
+    workerStats.traffic[name].requests = stats.r || 0;
+    workerStats.traffic[name].errors = stats.e || 0;
+    workerStats.traffic[name].lastReqAt = stats.last || null;
+  }
+  return true;
 }
 
 // Cache stats: prompt caching eligibility + TTFT comparison
@@ -560,7 +603,8 @@ function workerEnv(worker) {
   env.PATH = finalPath;
   // Per-worker OAuth token (overrides any inherited value)
   if (worker.token) {
-    env.CLAUDE_CODE_OAUTH_TOKEN = worker.token;
+    const liveToken = tokenRefresher?.getActiveToken(worker.name) || worker.token;
+    env.CLAUDE_CODE_OAUTH_TOKEN = liveToken;
   }
   // Headless / non-interactive mode — prevent ALL macOS interactive prompts
   env.CI = "true";                          // suppress macOS permission popups
@@ -672,6 +716,17 @@ const tokenTracker = createTokenTracker({ redis });
 // Metrics store: persistent time-series data for dashboard charts
 const metricsStore = createMetricsStore({ redis });
 
+// ── Auto-heal manager: request-level auth recovery for CLI workers ──
+const autoHeal = createAutoHealManager({
+  enabled: CONFIG.autoHeal?.enabled ?? true,
+  cooldownMs: CONFIG.autoHeal?.cooldownMs,
+  circuitFailThreshold: CONFIG.autoHeal?.circuitFailThreshold,
+  circuitOpenMs: CONFIG.autoHeal?.circuitOpenMs,
+  tokenRefresher,
+  tokenPool: TOKEN_POOL,
+  eventLog,
+});
+
 // System reaper: periodic cleanup of orphan OS processes
 const systemReaper = createSystemReaper(CONFIG.systemReaper);
 
@@ -764,6 +819,14 @@ function gatherMetricsSnapshot() {
     liveTokens: rs.liveTokens,
     events: counts,
     errorsByCategory: { ...workerStats.errors },
+    workerStats: {
+      traffic: Object.fromEntries(
+        Object.entries(workerStats.traffic).map(([name, stats]) => [
+          name,
+          { requests: stats.requests, errors: stats.errors, lastReqAt: stats.lastReqAt || null },
+        ])
+      ),
+    },
     sessionAffinity: sessionAffinity.getStats(),
     systemReaper: systemReaper.getStats(),
     cache: getCacheStats(),
@@ -1121,6 +1184,7 @@ function runCliOnce(prompt, model, systemPrompt, requestId = "", source = "", wo
       const err = new Error(`Execution timeout after ${SYNC_TIMEOUT_MS}ms`);
       err.exitCode = -1;
       err.workerName = worker.name;
+      err.isTimeout = true;
       reject(err);
     }, SYNC_TIMEOUT_MS);
 
@@ -1145,6 +1209,8 @@ function runCliOnce(prompt, model, systemPrompt, requestId = "", source = "", wo
         err.exitCode = code;
         err.workerName = worker.name;
         err.isRateLimit = rateErr;
+        err.stderr = stderr;
+        err.stdout = stdout;
         reject(err);
       } else {
         resolve(stdout.trim());
@@ -1165,18 +1231,58 @@ function runCliOnce(prompt, model, systemPrompt, requestId = "", source = "", wo
  * Uses retry policy for consistent retry behavior.
  */
 async function runCli(prompt, model, systemPrompt, requestId = "", source = "", sessionKey = "") {
-  return retryPolicy.withRetry(
-    () => runCliOnce(prompt, model, systemPrompt, requestId, source, null, sessionKey),
-    {
-      onRetry: (attempt, error, delayMs) => {
-        eventLog.push("retry", { reqId: requestId, attempt: attempt + 1, model, delay: delayMs, error: error.message });
-        console.log(
-          `[${ts()}] RETRY attempt=${attempt + 1}/${MAX_RETRIES} ` +
-          `model=${model} delay=${delayMs}ms err=${error.message}`
-        );
+  const primaryWorker = getNextWorker(sessionKey);
+  const autoHealRetries = CONFIG.autoHeal?.maxRetriesPerRequest ?? 1;
+
+  try {
+    return await runCliOnce(prompt, model, systemPrompt, requestId, source, primaryWorker, sessionKey);
+  } catch (err) {
+    const classification = classifyCliError({
+      exitCode: err.exitCode,
+      stderr: err.stderr,
+      stdout: err.stdout,
+      err,
+    });
+
+    if (classification.healable && CONFIG.autoHeal?.enabled !== false) {
+      const healResult = await autoHeal.heal(primaryWorker.name, classification.reason, requestId);
+      if (healResult?.success) {
+        let lastErr = null;
+        for (let i = 0; i < autoHealRetries; i++) {
+          try {
+            return await runCliOnce(prompt, model, systemPrompt, requestId, source, primaryWorker, sessionKey);
+          } catch (retryErr) {
+            lastErr = retryErr;
+          }
+        }
+        const alt = getAlternateWorker(primaryWorker.name);
+        if (alt) {
+          return await runCliOnce(prompt, model, systemPrompt, requestId, source, alt, sessionKey);
+        }
+        throw lastErr || err;
+      }
+
+      const alt = getAlternateWorker(primaryWorker.name);
+      if (alt) {
+        return await runCliOnce(prompt, model, systemPrompt, requestId, source, alt, sessionKey);
+      }
+      throw err;
+    }
+
+    return retryPolicy.withRetry(
+      () => runCliOnce(prompt, model, systemPrompt, requestId, source, null, sessionKey),
+      {
+        maxRetries: Math.max(0, MAX_RETRIES - 1),
+        onRetry: (attempt, error, delayMs) => {
+          eventLog.push("retry", { reqId: requestId, attempt: attempt + 1, model, delay: delayMs, error: error.message });
+          console.log(
+            `[${ts()}] RETRY attempt=${attempt + 1}/${MAX_RETRIES} ` +
+            `model=${model} delay=${delayMs}ms err=${error.message}`
+          );
+        },
       },
-    },
-  );
+    );
+  }
 }
 
 function spawnCliStream(prompt, model, systemPrompt, worker) {
@@ -2208,12 +2314,39 @@ async function handleCompletions(req, res) {
         }
       });
 
-      proc.on("close", (code) => {
+      proc.on("close", async (code) => {
         clearTimeout(firstByteTimer);
         clearTimeout(heartbeatTimer);
         clearTimeout(execTimer);
         clearInterval(keepaliveInterval);
         workerRelease(worker.name);
+
+        // Auth-related auto-heal: refresh token and retry same worker once
+        if (code !== 0 && !sentContent) {
+          const rateErr = isRateLimitError(code, stderrBuf) || isRateLimitError(code, buffer);
+          const classification = classifyCliError({
+            exitCode: code,
+            stderr: stderrBuf,
+            stdout: buffer,
+            err: { isRateLimit: rateErr },
+          });
+          if (classification.healable && CONFIG.autoHeal?.enabled !== false) {
+            const healResult = await autoHeal.heal(worker.name, classification.reason, reqId);
+            if (healResult?.success && retryCount < MAX_RETRIES) {
+              retryCount++;
+              console.log(`[${ts()}] AUTO_HEAL_RETRY reqId=${reqId} worker=${worker.name} reason=${classification.reason} -> retrying (attempt ${retryCount}/${MAX_RETRIES})`);
+              pipeStream(worker, true);
+              return;
+            }
+            const alt = getAlternateWorker(worker.name);
+            if (alt && retryCount < MAX_RETRIES) {
+              retryCount++;
+              console.log(`[${ts()}] AUTO_HEAL_FALLBACK reqId=${reqId} worker=${worker.name} -> ${alt.name} (attempt ${retryCount}/${MAX_RETRIES})`);
+              pipeStream(alt, true);
+              return;
+            }
+          }
+        }
 
         // Quick-fail auto-retry: if worker failed fast with no content, try another
         const elapsed = Date.now() - proc._spawnedAt;
@@ -2426,6 +2559,7 @@ function handleHealth(req, res) {
   const workers = _workerPool.map((w) => {
     const h = _workerHealth.get(w.name);
     const until = h.limitedUntil || null;
+    const healState = autoHeal.getWorkerState(w.name);
     return {
       name: w.name,
       bin: w.bin,
@@ -2438,6 +2572,13 @@ function handleHealth(req, res) {
       limitedUntil: until,
       limitedUntilIso: until ? new Date(until).toISOString() : null,
       limitedRemainingSec: h.limited && until ? Math.max(0, Math.round((until - Date.now()) / 1000)) : null,
+      autoHeal: {
+        cooldownUntil: healState.cooldownUntil || null,
+        cooldownRemainingSec: healState.cooldownUntil ? Math.max(0, Math.round((healState.cooldownUntil - Date.now()) / 1000)) : null,
+        circuitState: healState.circuitState,
+        circuitOpenUntil: healState.circuitOpenUntil || null,
+        circuitRemainingSec: healState.circuitOpenUntil ? Math.max(0, Math.round((healState.circuitOpenUntil - Date.now()) / 1000)) : null,
+      },
     };
   });
   sendJson(res, 200, {
@@ -2454,6 +2595,7 @@ function handleHealth(req, res) {
     sessionAffinity: sessionAffinity.getStats(),
     cache: getCacheStats(),
     workerStats,
+    autoHeal: autoHeal.getStats(),
     dashboard: CONFIG.dashboard,
     portal: CONFIG.portal,
   });
@@ -2474,6 +2616,7 @@ function handleMetrics(req, res) {
   const workers = _workerPool.map((w) => {
     const h = _workerHealth.get(w.name);
     const until = h.limitedUntil || null;
+    const healState = autoHeal.getWorkerState(w.name);
     return {
       name: w.name,
       disabled: !!w.disabled,
@@ -2483,8 +2626,16 @@ function handleMetrics(req, res) {
       limitedAt: h.limitedAt || null,
       limitedUntil: until,
       limitedRemainingSec: h.limited && until ? Math.max(0, Math.round((until - Date.now()) / 1000)) : null,
+      autoHeal: {
+        cooldownUntil: healState.cooldownUntil || null,
+        cooldownRemainingSec: healState.cooldownUntil ? Math.max(0, Math.round((healState.cooldownUntil - Date.now()) / 1000)) : null,
+        circuitState: healState.circuitState,
+        circuitOpenUntil: healState.circuitOpenUntil || null,
+        circuitRemainingSec: healState.circuitOpenUntil ? Math.max(0, Math.round((healState.circuitOpenUntil - Date.now()) / 1000)) : null,
+      },
     };
   });
+  const autoHealStats = autoHeal.getStats();
   sendJson(res, 200, {
     rateLimits: RATE_LIMITS,
     rateUsage: rateLimiter.stats(),
@@ -2523,6 +2674,13 @@ function handleMetrics(req, res) {
     sessionAffinity: sessionAffinity.getStats(),
     cache: getCacheStats(),
     workerStats,
+    workerStatsWindow: computeWorkerWindowStats(),
+    autoHeal: autoHealStats,
+    auto_heal_triggered: autoHealStats.triggered,
+    auto_heal_success: autoHealStats.success,
+    auto_heal_fail: autoHealStats.fail,
+    last_heal_at: autoHealStats.lastHealAt,
+    heal_reason: autoHealStats.lastHealReason,
     activeConnections: Object.fromEntries(_activeConns),
     systemReaper: systemReaper.getStats(),
     unifiedRateLimits: getUnifiedRateLimits(),
@@ -2846,6 +3004,9 @@ server.listen(PORT, "0.0.0.0", async () => {
   // Seed token tracker from all raw metrics snapshots (sums across server restarts)
   const rawSnapshots = metricsStore.getRawBuffer();
   tokenTracker.seedFromHistory(rawSnapshots);
+
+  // Restore worker traffic counts across restarts (best-effort)
+  seedWorkerStatsFromHistory();
 
   metricsStore.startSampler(gatherMetricsSnapshot);
   tokenRefresher.start();

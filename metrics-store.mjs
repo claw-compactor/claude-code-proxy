@@ -227,6 +227,7 @@ export function createMetricsStore(options = {}) {
         t: data.liveTokens?.total || 0,
       },
       err: buildErrorSnapshot(data.errorsByCategory || {}),
+      workers: buildWorkerSnapshot(data.workerStats?.traffic || {}),
     });
 
     buffer =
@@ -257,6 +258,18 @@ export function createMetricsStore(options = {}) {
     const out = {};
     for (const [cat, count] of Object.entries(byCategory)) {
       if (count > 0) out[cat] = count;
+    }
+    return Object.freeze(out);
+  }
+
+  function buildWorkerSnapshot(traffic) {
+    const out = {};
+    for (const [name, stats] of Object.entries(traffic || {})) {
+      out[name] = {
+        r: stats.requests || 0,
+        e: stats.errors || 0,
+        last: stats.lastReqAt || null,
+      };
     }
     return Object.freeze(out);
   }

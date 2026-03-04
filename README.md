@@ -44,6 +44,7 @@ Clients (OpenAI format)
 | `server.mjs` | Main server: routing, API translation, streaming |
 | `config-loader.mjs` | Loads and validates `proxy.config.json` |
 | `token-refresh.mjs` | OAuth token auto-refresh (proactive + on-401) |
+| `auto-heal.mjs` | Request-level auto-heal for CLI auth failures |
 | `fair-queue.mjs` | Per-source fair queuing with concurrency limits |
 | `rate-limiter.mjs` | Local rate limiting (requests/min, tokens/min) |
 | `session-affinity.mjs` | Sticky sessions for prompt cache optimization |
@@ -105,10 +106,12 @@ npm run dev
 |----------|--------|-------------|
 | `/v1/chat/completions` | POST | OpenAI-compatible chat completion (sync + streaming) |
 | `/health` | GET | Health check with worker status |
-| `/metrics` | GET | Detailed metrics (tokens, latency, cache, queue) |
+| `/metrics` | GET | Detailed metrics (tokens, latency, cache, queue, per-worker traffic) |
 | `/dashboard` | GET | Real-time monitoring dashboard |
 | `/portal` | GET | Portal page with embedded dashboard |
 | `/events` | GET | SSE stream for live dashboard updates |
+
+`/metrics` includes `workerStats` (realtime totals) and `workerStatsWindow` (last 1h deltas) so the dashboard can compare workers even after restarts.
 
 ### Supported Models
 

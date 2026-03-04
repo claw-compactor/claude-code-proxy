@@ -383,12 +383,14 @@ async function fetchHistory() {
 }
 
 // ── Worker Card Renderer ──
-function renderWorkerCard(name, traffic, router, tokenHealth, unified, activeConns) {
+function renderWorkerCard(name, traffic, router, tokenHealth, unified, activeConns, windowStats) {
   const isLimited = router?.limited || false;
   const th = tokenHealth || {};
   const u = unified || {};
   const reqs = traffic?.requests || 0;
   const errs = traffic?.errors || 0;
+  const winReqs = windowStats?.requests || 0;
+  const winErrs = windowStats?.errors || 0;
   const active = activeConns || 0;
   const lastAgo = traffic?.lastReqAt ? fmt(Date.now() - traffic.lastReqAt) : 'never';
 
@@ -419,6 +421,8 @@ function renderWorkerCard(name, traffic, router, tokenHealth, unified, activeCon
   // Traffic
   html += `<div class="wc-row"><span class="k">requests</span><span class="val b">${reqs}</span></div>`;
   html += `<div class="wc-row"><span class="k">errors</span><span class="val ${errs > 0 ? 'r' : ''}">${errs}</span></div>`;
+  html += `<div class="wc-row"><span class="k">1h requests</span><span class="val ${winReqs > 0 ? 'b' : ''}">${winReqs}</span></div>`;
+  html += `<div class="wc-row"><span class="k">1h errors</span><span class="val ${winErrs > 0 ? 'r' : ''}">${winErrs}</span></div>`;
   html += `<div class="wc-row"><span class="k">active</span><span class="val ${active > 0 ? 'g' : ''}">${active}</span></div>`;
   html += `<div class="wc-row"><span class="k">last request</span><span class="val">${lastAgo}</span></div>`;
 
@@ -466,6 +470,7 @@ async function refresh() {
 
     const cfg = metrics.config || {};
     const ws = metrics.workerStats || {};
+    const wsWindow = metrics.workerStatsWindow || {};
     const ac = metrics.activeConnections || {};
     const tokenHealth = metrics.tokenRefreshStatus || {};
     const unified = metrics.unifiedRateLimits || {};
@@ -535,6 +540,7 @@ async function refresh() {
         tokenHealth[name],
         unified[name],
         ac[name] || 0,
+        wsWindow.traffic?.[name],
       );
     }
     if (allWorkerNames.length === 0) {
