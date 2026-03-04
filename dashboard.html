@@ -60,6 +60,7 @@
   .wc-status.healthy { background: rgba(63,185,80,0.15); color: var(--green); }
   .wc-status.limited { background: rgba(248,81,73,0.15); color: var(--red); }
   .wc-status.refreshing { background: rgba(210,136,62,0.15); color: var(--orange); }
+  .wc-status.disabled { background: rgba(139,148,158,0.15); color: var(--text2); }
   .wc-row { display: flex; justify-content: space-between; align-items: baseline; padding: 3px 0; }
   .wc-row .k { font-size: 11px; color: var(--text2); }
   .wc-row .v { font-size: 12px; font-weight: 600; }
@@ -381,9 +382,11 @@ function renderWorkerCard(name, traffic, router, tokenHealth, unified, activeCon
   // Token health
   const expiresMs = th.expiresInMs || 0;
   const expiresHuman = th.expiresInHuman || '-';
-  const expColor = expiresMs > 7200000 ? 'g' : expiresMs > 1800000 ? 'y' : 'r';
+  const tokenReason = router?.tokenReason || null;
+  const expLabel = tokenReason || expiresHuman;
+  const expColor = tokenReason ? 'r' : (expiresMs > 7200000 ? 'g' : expiresMs > 1800000 ? 'y' : 'r');
   const expBarPct = th.expiresAt > 0 ? Math.min(100, Math.max(0, (expiresMs / 28800000) * 100)) : 0;
-  const expBarColor = expiresMs > 7200000 ? 'var(--green)' : expiresMs > 1800000 ? 'var(--yellow)' : 'var(--red)';
+  const expBarColor = tokenReason ? 'var(--red)' : (expiresMs > 7200000 ? 'var(--green)' : expiresMs > 1800000 ? 'var(--yellow)' : 'var(--red)');
 
   // Unified rate limits
   const d7Pct = Math.round((u.d7Utilization || 0) * 100);
@@ -393,10 +396,11 @@ function renderWorkerCard(name, traffic, router, tokenHealth, unified, activeCon
 
   // Status
   let statusClass = 'healthy', statusText = 'healthy';
-  if (isLimited) { statusClass = 'limited'; statusText = 'rate limited'; }
+  if (router?.disabled) { statusClass = 'disabled'; statusText = 'disabled'; }
+  else if (isLimited) { statusClass = 'limited'; statusText = 'rate limited'; }
   else if (th.isRefreshing) { statusClass = 'refreshing'; statusText = 'refreshing'; }
 
-  let html = `<div class="worker-card ${isLimited ? 'limited' : ''}">`;
+  let html = `<div class="worker-card ${isLimited ? 'limited' : ''} ${router?.disabled ? 'disabled' : ''}">`;
   html += `<div class="wc-header"><span class="wc-name">Worker ${name}</span><span class="wc-status ${statusClass}">${statusText}</span></div>`;
 
   // Traffic
@@ -407,7 +411,7 @@ function renderWorkerCard(name, traffic, router, tokenHealth, unified, activeCon
 
   // Token expiry
   html += '<hr class="wc-divider">';
-  html += `<div class="wc-row"><span class="k">token expires</span><span class="val ${expColor}">${expiresHuman}</span></div>`;
+  html += `<div class="wc-row"><span class="k">token expires</span><span class="val ${expColor}">${expLabel}</span></div>`;
   html += `<div class="bar-sm"><div class="fill" style="width:${expBarPct}%;background:${expBarColor}"></div></div>`;
   if (th.refreshCount > 0) {
     const lastRefresh = th.lastRefreshAt ? new Date(th.lastRefreshAt).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' }) : 'never';

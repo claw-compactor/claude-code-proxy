@@ -69,8 +69,10 @@ const CLAUDE_BIN = CONFIG.workers[0]?.bin || "claude";
 const PRIMARY_WORKER = CONFIG.routing.primaryWorker;
 const HEALTH_CHECK_MS = CONFIG.routing.healthCheckMs;
 const USE_CLI_AGENTS = CONFIG.routing.useCliAgents;
+const LOAD_BALANCE_ENABLED = CONFIG.routing.loadBalance ?? false;
 
 const _workerPool = CONFIG.workers;
+const _enabledWorkers = () => _workerPool.filter(w => !w.disabled);
 
 // Worker health state
 const _workerHealth = new Map(); // name -> { limited: boolean, limitedAt: number, limitedUntil: number }
@@ -112,6 +114,7 @@ const TOKEN_POOL = (() => {
   const tokens = [];
   // Worker tokens from config (each worker can have its own OAuth token)
   for (const w of _workerPool) {
+    if (w.disabled) continue;
     if (w.token) tokens.push({ name: w.name, token: w.token, type: "oauth_flat" });
   }
   // Fallback to process-level CLAUDE_CODE_OAUTH_TOKEN (env only — not in config file for security)
@@ -334,7 +337,7 @@ function getCacheStats() {
 
 // _loadBalanceMode starts true: round-robin across all healthy workers
 // Falls back to single-worker mode when one worker is rate-limited
-let _loadBalanceMode = true;
+let _loadBalanceMode = LOAD_BALANCE_ENABLED;
 
 // Active connection tracking — for least-connections routing
 const _activeConns = new Map(_workerPool.map(w => [w.name, 0]));
@@ -376,11 +379,13 @@ function leastLoadedWorker(pool) {
  */
 function getNextWorker(sessionKey) {
   const isHealthy = (name) => isWorkerHealthy(name);
-  const healthy = _workerPool.filter((w) => isHealthy(w.name));
+  const enabled = _enabledWorkers();
+  const pool = enabled.length > 0 ? enabled : _workerPool;
+  const healthy = pool.filter((w) => isHealthy(w.name));
 
   if (healthy.length === 0) {
     // All workers limited — pick the one that was limited longest ago
-    const sorted = [..._workerPool].sort(
+    const sorted = [...pool].sort(
       (a, b) => _workerHealth.get(a.name).limitedAt - _workerHealth.get(b.name).limitedAt,
     );
     console.log(`[CLIRouter] ALL LIMITED — trying oldest-limited: ${sorted[0].name}`);
@@ -405,7 +410,7 @@ function getNextWorker(sessionKey) {
   if (sessionKey) {
     const aff = sessionAffinity.lookup(sessionKey, isHealthy);
     if (aff?.hit) {
-      const affinityWorker = _workerPool.find((w) => w.name === aff.workerName);
+      const affinityWorker = pool.find((w) => w.name === aff.workerName);
       if (affinityWorker) {
         const affConns = _activeConns.get(affinityWorker.name) || 0;
         // Use affinity only if it's strictly less loaded (not just equal)
@@ -443,7 +448,9 @@ function markWorkerLimited(workerName, errText = "") {
     const resetAt = parseResetTimeFromText(errText);
     h.limitedUntil = resetAt || (Date.now() + HEALTH_CHECK_MS);
     _loadBalanceMode = false; // back to single-worker mode
-    const other = _workerPool.find((w) => w.name !== workerName);
+    const enabled = _enabledWorkers();
+    const pool = enabled.length > 0 ? enabled : _workerPool;
+    const other = pool.find((w) => w.name !== workerName);
     const untilStr = h.limitedUntil ? new Date(h.limitedUntil).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }) : "unknown";
     console.log(`[CLIRouter] ${workerName} RATE LIMITED — switching all traffic to ${other?.name || "?"} (cooldown until ${untilStr})`);
     eventLog.push("worker_limited", { worker: workerName, switchedTo: other?.name, limitedUntil: h.limitedUntil || null });
@@ -456,9 +463,9 @@ function markWorkerRecovered(workerName) {
     h.limited = false;
     h.limitedAt = 0;
     h.limitedUntil = 0;
-    _loadBalanceMode = true; // both workers healthy → share the load
+    _loadBalanceMode = LOAD_BALANCE_ENABLED; // both workers healthy → share the load (if enabled)
     console.log(`[CLIRouter] ${workerName} RECOVERED — entering load-balance mode (round-robin)`);
-    eventLog.push("worker_recovered", { worker: workerName, loadBalance: true });
+    eventLog.push("worker_recovered", { worker: workerName, loadBalance: _loadBalanceMode });
   }
 }
 
@@ -486,7 +493,9 @@ function isWorkerHealthy(name) {
 
 // Health check timer: every HEALTH_CHECK_MS, try to recover limited workers
 setInterval(() => {
-  for (const w of _workerPool) {
+  const enabled = _enabledWorkers();
+  const pool = enabled.length > 0 ? enabled : _workerPool;
+  for (const w of pool) {
     const h = _workerHealth.get(w.name);
     if (!h?.limited) continue;
     const until = h.limitedUntil || (h.limitedAt + HEALTH_CHECK_MS);
@@ -1143,19 +1152,25 @@ function trackStreamProc(proc, requestId, model, source, worker) {
 
 // Pick a specific worker by name, or fallback to round-robin
 function getWorkerByName(name) {
-  return _workerPool.find((w) => w.name === name) || null;
+  const enabled = _enabledWorkers();
+  const pool = enabled.length > 0 ? enabled : _workerPool;
+  return pool.find((w) => w.name === name) || null;
 }
 
 function getAlternateWorker(excludeName) {
-  const healthy = _workerPool.filter(
+  const enabled = _enabledWorkers();
+  const pool = enabled.length > 0 ? enabled : _workerPool;
+  const healthy = pool.filter(
     (w) => w.name !== excludeName && isWorkerHealthy(w.name)
   );
   return healthy.length > 0 ? healthy[0] : null;
 }
 
 function getAllLimitedStatus() {
-  const limited = _workerPool.filter((w) => !isWorkerHealthy(w.name));
-  if (limited.length !== _workerPool.length || limited.length === 0) return null;
+  const enabled = _enabledWorkers();
+  const pool = enabled.length > 0 ? enabled : _workerPool;
+  const limited = pool.filter((w) => !isWorkerHealthy(w.name));
+  if (limited.length !== pool.length || limited.length === 0) return null;
   let nextReset = null;
   for (const w of limited) {
     const h = _workerHealth.get(w.name);
@@ -1947,7 +1962,9 @@ async function handleCompletions(req, res) {
     // automatically retry on a different worker before giving up.
     // If ALL CLI routers fail, fall back to the API endpoint (e.g. MiniMax).
     const QUICK_FAIL_MS = 5000;
-    const MAX_RETRIES = _workerPool.length;  // try each router once
+    const retryPoolBase = _enabledWorkers();
+    const retryPool = retryPoolBase.length > 0 ? retryPoolBase : _workerPool;
+    const MAX_RETRIES = retryPool.length;  // try each router once
     const inputEstimate = Math.ceil(prompt.length / 4);
     const originalMessages = messages;  // preserve for fallback API
     let retryCount = 0;
@@ -2117,7 +2134,7 @@ async function handleCompletions(req, res) {
         const elapsed = Date.now() - proc._spawnedAt;
         if (code !== 0 && !sentContent && elapsed < QUICK_FAIL_MS && retryCount < MAX_RETRIES) {
           // Find an untried router, or any alternate
-          const untried = _workerPool.find(
+          const untried = retryPool.find(
             (w) => !triedRouters.has(w.name) && isWorkerHealthy(w.name)
           );
           const alt = untried || getAlternateWorker(worker.name);
@@ -2211,7 +2228,7 @@ async function handleCompletions(req, res) {
         workerRelease(worker.name);
         // Quick-fail auto-retry on spawn error too
         if (!sentContent && retryCount < MAX_RETRIES) {
-          const untried = _workerPool.find(
+          const untried = retryPool.find(
             (w) => !triedRouters.has(w.name) && isWorkerHealthy(w.name)
           );
           const alt = untried || getAlternateWorker(worker.name);
@@ -2307,6 +2324,14 @@ function handleModels(req, res) {
   sendJson(res, 200, { object: "list", data: models });
 }
 
+function getWorkerTokenReason(worker) {
+  const now = Date.now();
+  if (worker.disabled) return worker.disabledReason || "disabled";
+  if (!worker.token && !worker.refreshToken) return "no token";
+  if (worker.expiresAt && worker.expiresAt > 0 && worker.expiresAt <= now) return "expired";
+  return null;
+}
+
 function handleHealth(req, res) {
   const qs = queue.getStats();
   const rs = registry.getStats();
@@ -2316,6 +2341,9 @@ function handleHealth(req, res) {
     return {
       name: w.name,
       bin: w.bin,
+      disabled: !!w.disabled,
+      disabledReason: w.disabledReason || null,
+      tokenReason: getWorkerTokenReason(w),
       limited: h.limited,
       limitedAt: h.limitedAt || null,
       limitedAgoSec: h.limited ? Math.round((Date.now() - h.limitedAt) / 1000) : null,
@@ -2351,6 +2379,9 @@ function handleMetrics(req, res) {
     const until = h.limitedUntil || null;
     return {
       name: w.name,
+      disabled: !!w.disabled,
+      disabledReason: w.disabledReason || null,
+      tokenReason: getWorkerTokenReason(w),
       limited: h.limited,
       limitedAt: h.limitedAt || null,
       limitedUntil: until,
@@ -2723,14 +2754,16 @@ server.listen(PORT, "0.0.0.0", async () => {
   // Pre-warm worker pool: spawn processes for the most common configs
   if (WARM_POOL_ENABLED) {
     const prewarmConfigs = [];
-    for (const worker of _workerPool) {
+    const enabled = _enabledWorkers();
+    const pool = enabled.length > 0 ? enabled : _workerPool;
+    for (const worker of pool) {
       // Pre-warm sync sonnet (most common: batch labeler, general queries)
       prewarmConfigs.push({ model: "sonnet", isStream: false, worker, count: 1 });
       // Pre-warm stream sonnet (most common streaming config)
       prewarmConfigs.push({ model: "sonnet", isStream: true, worker, count: 1 });
     }
     warmPool.prewarm(prewarmConfigs);
-    console.log(`[WarmPool] Pre-warmed ${prewarmConfigs.length} worker(s) across ${_workerPool.length} CLI router(s)`);
+    console.log(`[WarmPool] Pre-warmed ${prewarmConfigs.length} worker(s) across ${pool.length} CLI router(s)`);
   }
 
   console.log(`Claude Code Proxy v0.5.1`);
