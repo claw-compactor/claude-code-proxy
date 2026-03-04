@@ -1757,7 +1757,16 @@ async function handleApiDirect(body, model, stream, source, req, res) {
   }
 
   rateLimiter.record(model, estTokens);
-  const tokenEntry = getNextToken();
+
+  const requestedTokenRaw = req.headers["x-token-name"] ?? body.tokenName;
+  let tokenEntry = null;
+  if (requestedTokenRaw !== undefined && requestedTokenRaw !== null) {
+    const requestedTokenName = String(requestedTokenRaw).trim();
+    if (requestedTokenName) {
+      tokenEntry = TOKEN_POOL.find(t => t.name === requestedTokenName) || null;
+    }
+  }
+  if (!tokenEntry) tokenEntry = getNextToken();
   await waitForTokenCooldown(tokenEntry);
   recordWorkerRequest(tokenEntry.name);
   eventLog.push("request", {

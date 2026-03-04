@@ -132,6 +132,26 @@ curl -X POST http://localhost:8403/v1/chat/completions \
   }'
 ```
 
+### Explicit Token Routing (worker3)
+
+Optionally route a request to a specific worker by name:
+
+- Header: `x-token-name: worker3`
+- Body: `{ "tokenName": "worker3" }`
+
+If omitted, the proxy keeps the existing least-utilization routing behavior.
+
+```bash
+curl -X POST http://localhost:8403/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "x-token-name: worker3" \
+  -d '{
+    "model": "sonnet",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 100
+  }'
+```
+
 ## Configuration Reference
 
 See `proxy.config.sample.json` for a full template. Key sections:
