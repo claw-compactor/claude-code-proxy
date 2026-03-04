@@ -34,6 +34,7 @@ import { createMetricsStore } from "./metrics-store.mjs";
 import { createRateLimiter } from "./rate-limiter.mjs";
 import { createRedisClient } from "./redis-client.mjs";
 import { createSessionAffinity } from "./session-affinity.mjs";
+import { createSessionCacheStats } from "./session-cache-stats.mjs";
 import { createSystemReaper } from "./system-reaper.mjs";
 import { createWarmPool } from "./worker-pool.mjs";
 import { loadConfig } from "./config-loader.mjs";
@@ -341,6 +342,17 @@ function getCacheStats() {
     ttftUncachedAvg: cacheStats.ttftUncachedAvg,
     recentKeys: cacheStats.recentKeys.size,
   };
+}
+
+// Session cache stats — per session hit/miss tracking
+const sessionCacheStats = createSessionCacheStats({
+  ttlMs: CONFIG.sessionStats?.ttlMs,
+  cleanupIntervalMs: CONFIG.sessionStats?.cleanupIntervalMs,
+  topN: CONFIG.sessionStats?.topN,
+});
+
+function getSessionIdForStats(req) {
+  return req?.headers?.["x-session-id"] || "";
 }
 
 // _loadBalanceMode starts true: round-robin across all healthy workers
@@ -889,6 +901,10 @@ function splitSystemForCache(systemText) {
   const keyPrefix = keyNormalized ? keyNormalized.slice(0, Math.min(prefixLen, keyNormalized.length)) : "";
   return { normalized, prefix, suffix, cacheable: true, keyPrefix };
 }
+function getSessionIdFromRequest(req, body) {
+  return req?.headers?.["x-session-id"] || body?.session_id || "";
+}
+
 function buildCacheContext({ body, model, source, req, applyCacheControl }) {
   const tenant = req?.headers?.["x-tenant-id"] || req?.headers?.["x-openclaw-tenant"] || source || "unknown";
   const sessionId = CACHE_SESSION_SCOPE === "none"
@@ -1783,6 +1799,7 @@ async function handleApiDirect(body, model, stream, source, req, res) {
   recordCacheCandidate(cacheCtx.candidateCount);
   recordCacheApplied(cacheCtx.appliedCount);
   const cacheSeen = recordCacheKey(cacheCtx.cacheKeyHash);
+  sessionCacheStats.record(getSessionIdForStats(req), cacheSeen.seen);
   console.log(
     `[${ts()}] CACHE_CTX reqId=${reqId} src=${source} tenant=${cacheCtx.tenant} model=${model} ` +
     `candidate=${cacheCtx.candidateCount} applied=${cacheCtx.appliedCount} ` +
@@ -1948,6 +1965,7 @@ async function handleCompletions(req, res) {
   recordCacheCandidate(cacheCtx.candidateCount);
   recordCacheApplied(cacheCtx.appliedCount);
   const cacheSeen = recordCacheKey(cacheCtx.cacheKeyHash);
+  sessionCacheStats.record(getSessionIdForStats(req), cacheSeen.seen);
 
   const priority = MODEL_PRIORITY[model] || "normal";
   // Estimated tokens for rate-limiter: use a small fixed cap.
@@ -2444,6 +2462,15 @@ function handleHealth(req, res) {
 function handleMetrics(req, res) {
   const qs = queue.getStats();
   const rs = registry.getStats();
+  const url = new URL(req.url, `http://0.0.0.0:${PORT}`);
+  const sessionLimitRaw = parseInt(url.searchParams.get("sessions_limit") || "", 10);
+  const sessionOffsetRaw = parseInt(url.searchParams.get("sessions_offset") || "0", 10);
+  const defaultSessionLimit = CONFIG.sessionStats?.topN ?? 50;
+  const sessionLimit = Number.isFinite(sessionLimitRaw)
+    ? Math.max(1, Math.min(sessionLimitRaw, 500))
+    : defaultSessionLimit;
+  const sessionOffset = Number.isFinite(sessionOffsetRaw) ? Math.max(0, sessionOffsetRaw) : 0;
+  const sessions = sessionCacheStats.getStats({ limit: sessionLimit, offset: sessionOffset });
   const workers = _workerPool.map((w) => {
     const h = _workerHealth.get(w.name);
     const until = h.limitedUntil || null;
@@ -2467,6 +2494,7 @@ function handleMetrics(req, res) {
     primaryRouter: PRIMARY_WORKER,
     queue: qs,
     processes: rs,
+    sessions,
     config: {
       version: CONFIG.dashboard.version,
       useCliAgents: USE_CLI_AGENTS,
@@ -2486,6 +2514,7 @@ function handleMetrics(req, res) {
       maxIdleMs: MAX_IDLE_MS,
       reaperIntervalMs: REAPER_INTERVAL_MS,
       sessionAffinityTtlMs: CONFIG.sessionAffinity?.ttlMs ?? 30 * 60 * 1000,
+      sessionStats: CONFIG.sessionStats,
       cacheControl: CONFIG.cacheControl,
       sseKeepaliveMs: 30_000,
       maxRetries: MAX_RETRIES,

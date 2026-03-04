@@ -229,6 +229,10 @@ export function loadConfig() {
 
   const sessionAffinityTtlMs = resolve(file, "sessionAffinity.ttlMs", "SESSION_AFFINITY_TTL_MS", 30 * 60 * 1000, toInt);
 
+  const sessionStatsTtlMs = resolve(file, "sessionStats.ttlMs", "SESSION_STATS_TTL_MS", 24 * 60 * 60 * 1000, toInt);
+  const sessionStatsCleanupMs = resolve(file, "sessionStats.cleanupIntervalMs", "SESSION_STATS_CLEANUP_MS", 5 * 60 * 1000, toInt);
+  const sessionStatsTopN = resolve(file, "sessionStats.topN", "SESSION_STATS_TOP_N", 50, toInt);
+
   const cacheControl = {
     enabled: resolve(file, "cacheControl.enabled", "CACHE_CONTROL_ENABLED", true, toBool),
     systemPrefixChars: resolve(file, "cacheControl.systemPrefixChars", "CACHE_CONTROL_SYSTEM_PREFIX_CHARS", 1200, toInt),
@@ -353,6 +357,7 @@ export function loadConfig() {
     process: { maxProcessAgeMs, maxIdleMs, reaperIntervalMs },
     warmPool: { enabled: warmPoolEnabled, size: warmPoolSize, maxAgeMs: warmPoolMaxAgeMs },
     sessionAffinity: { ttlMs: sessionAffinityTtlMs },
+    sessionStats: { ttlMs: sessionStatsTtlMs, cleanupIntervalMs: sessionStatsCleanupMs, topN: sessionStatsTopN },
     cacheControl,
     rateLimits,
     anthropic: { apiBase: anthropicApiBase, apiVersion: anthropicApiVersion, models: anthropicModels },

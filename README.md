@@ -47,6 +47,7 @@ Clients (OpenAI format)
 | `fair-queue.mjs` | Per-source fair queuing with concurrency limits |
 | `rate-limiter.mjs` | Local rate limiting (requests/min, tokens/min) |
 | `session-affinity.mjs` | Sticky sessions for prompt cache optimization |
+| `session-cache-stats.mjs` | Per-session cache hit/miss analytics |
 | `metrics-store.mjs` | Time-series metrics with Redis persistence |
 | `process-registry.mjs` | CLI process lifecycle tracking |
 | `event-log.mjs` | Structured event log with Redis persistence |
@@ -197,6 +198,12 @@ Anthropic prompt cache optimization:
 
 See `docs/cache-optimization.md` for hit-rate tactics and anti-patterns.
 
+### `sessionStats`
+Per-session cache analytics:
+- `ttlMs`: Retain per-session events for this long (default: 24h)
+- `cleanupIntervalMs`: Prune expired sessions on this interval (default: 5m)
+- `topN`: Default sessions returned by `/metrics` (default: 50)
+
 ### `queue`
 Fair queuing with per-source isolation:
 - `maxConcurrent`: Global concurrent request limit
@@ -234,14 +241,18 @@ Real-time dashboard showing:
 - Rate limit utilization (5h and 7d)
 - Request latency percentiles
 - Cache hit rates and TTFT comparison
+- Per-session cache analytics (5m/15m/1h hit rates)
 
 ### Metrics (`/metrics`)
+
+Supports session pagination via `?sessions_limit=50&sessions_offset=0`.
 
 JSON endpoint with:
 - Per-model token counts and request counts
 - Per-worker utilization and health
 - Queue depth and wait times
 - Cache statistics
+- Session cache analytics (paginated)
 - Token refresh status
 
 ## Security

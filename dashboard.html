@@ -120,6 +120,13 @@
   .re .c { color: var(--red); flex-shrink: 0; width: 75px; font-weight: 500; }
   .re .d { color: var(--text2); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+  /* ── Sessions ── */
+  .sessions-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .sessions-table th, .sessions-table td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--bg3); }
+  .sessions-table th { color: var(--text2); font-weight: 600; text-transform: uppercase; font-size: 9px; letter-spacing: 0.6px; }
+  .sessions-table td.mono { font-family: 'SF Mono', 'Menlo', monospace; }
+  .sessions-table td.rate { font-weight: 600; }
+
   /* ── Rate limit bars ── */
   .rate-section { margin-bottom: 4px; }
   .rate-bar-wrap { margin: 2px 0; }
@@ -236,6 +243,12 @@
       <h2>Errors <span class="cnt" id="err-total"></span></h2>
       <div id="errors-body"><div class="empty">loading...</div></div>
     </div>
+  </div>
+
+  <!-- Sessions -->
+  <div class="card">
+    <h2>Sessions <span class="cnt" id="sessions-count"></span></h2>
+    <div class="scroll" id="sessions-body"><div class="empty">loading...</div></div>
   </div>
 
   <!-- Live Stream + Processes -->
@@ -580,6 +593,34 @@ async function refresh() {
     }
     if (!eHtml) eHtml = '<div class="empty">no errors</div>';
     document.getElementById('errors-body').innerHTML = eHtml;
+
+    // ── Sessions ──
+    const sessions = metrics.sessions || { items: [], total: 0, limit: 0, offset: 0 };
+    document.getElementById('sessions-count').textContent = sessions.total > 0 ? `${sessions.total} total` : '';
+    let sHtml = '';
+    if (sessions.items && sessions.items.length > 0) {
+      const rows = sessions.items.map(s => {
+        const totalReq = (s.hits || 0) + (s.misses || 0);
+        const sid = s.sessionId || 'anonymous';
+        const sidShort = sid.length > 26 ? '…' + sid.slice(-24) : sid;
+        const lastHit = s.lastHitIso ? shortTime(s.lastHitIso) : '-';
+        return `<tr>
+          <td class="mono" title="${sid}">${sidShort}</td>
+          <td class="rate">${s.hitRate5m || '0%'}</td>
+          <td class="rate">${s.hitRate15m || '0%'}</td>
+          <td class="rate">${s.hitRate1h || '0%'}</td>
+          <td>${totalReq}/${s.hits || 0}/${s.misses || 0}</td>
+          <td>${lastHit}</td>
+        </tr>`;
+      }).join('');
+      sHtml = `<table class="sessions-table">
+        <thead><tr><th>Session</th><th>5m HR</th><th>15m HR</th><th>1h HR</th><th>req/hit/miss</th><th>last hit</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+    } else {
+      sHtml = '<div class="empty">no session activity</div>';
+    }
+    document.getElementById('sessions-body').innerHTML = sHtml;
 
     // ── Processes ──
     const allProcs = allProcsForLive;
