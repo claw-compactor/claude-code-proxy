@@ -208,6 +208,10 @@ Workers with `refreshToken` set benefit from automatic renewal:
 
 ## Monitoring
 
+### Worker3 Watchdog
+
+See `docs/worker3-watchdog.md` for the 5‑minute watchdog script that probes worker3, auto-refreshes token 3, and restarts the proxy on failure.
+
 ### Dashboard (`/dashboard`)
 
 Real-time dashboard showing:
