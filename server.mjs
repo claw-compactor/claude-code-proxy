@@ -137,7 +137,7 @@ const ANTHROPIC_MODEL_IDS = CONFIG.anthropic.models;
 // Token pool for API direct — managed by lib/token-pool.mjs
 const TOKEN_POOL = buildTokenPool(_workerPool);
 const tokenPoolManager = createTokenPoolManager(TOKEN_POOL);
-const { getNextToken, setTokenCooldown, getTokenCooldownMs, waitForTokenCooldown, captureUnifiedRateHeaders, getUnifiedRateLimits, getTokenRoutingSnapshot } = tokenPoolManager;
+const { getNextToken, setTokenCooldown, getTokenCooldownMs, waitForTokenCooldown, captureUnifiedRateHeaders, getUnifiedRateLimits, getTokenRoutingSnapshot, markTokenAuthError, clearTokenAuthError } = tokenPoolManager;
 
 // ── Token refresher: auto-refresh OAuth tokens on 401 + proactive pre-expiry ──
 const tokenRefresher = createTokenRefresher({
@@ -158,6 +158,8 @@ const tokenHealthProbe = createTokenHealthProbe({
   tokenRefresher,
   captureUnifiedRateHeaders,
   setTokenCooldown,
+  markTokenAuthError,
+  clearTokenAuthError,
   log: console.log,
 });
 
@@ -803,6 +805,8 @@ function getAnthropicClient() {
       tokenTracker,
       eventLog,
       sseBroadcast,
+      markTokenAuthError,
+      clearTokenAuthError,
       log: console.log,
     });
   }

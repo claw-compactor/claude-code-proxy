@@ -24,6 +24,10 @@ const AUTH_PATTERNS = [
   "oauth",
   "login",
   "401",
+  "403",
+  "forbidden",
+  "permission_error",
+  "token has been revoked",
   "not authenticated",
   "sign in",
 ];
@@ -51,7 +55,9 @@ export function classifyCliError({ exitCode, stderr, stdout, err } = {}) {
 
   const isAuth = AUTH_PATTERNS.some((p) => combined.includes(p));
   if (isAuth) {
-    const reason = combined.includes("401") ? "auth_401" : "auth_expired";
+    const reason = combined.includes("403") || combined.includes("revoked") || combined.includes("permission_error")
+      ? "auth_revoked"
+      : combined.includes("401") ? "auth_401" : "auth_expired";
     return { kind: "auth", reason, healable: true };
   }
 
