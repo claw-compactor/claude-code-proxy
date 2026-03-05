@@ -26,6 +26,7 @@ export function createMetricsController({
   getWorkerTokenReason = null,
   tokenHealthProbe = null,
   getTokenRoutingSnapshot = null,
+  tokenHealthManager = null,
   logger = console,
 } = {}) {
   function computeWorkerWindowStats(windowMs = 60 * 60 * 1000) {
@@ -172,6 +173,7 @@ export function createMetricsController({
       rateLimitEnhanced: getTokenRoutingSnapshot?.() || {},
       tokenRefreshStatus: tokenRefresher?.getStatus?.() || null,
       tokenProbe: tokenHealthProbe?.getResults?.() || {},
+      tokenHealthStates: tokenHealthManager?.getSnapshot?.() || {},
       generatedAt: ts(),
     };
   }

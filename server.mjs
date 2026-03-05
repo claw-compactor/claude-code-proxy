@@ -68,6 +68,7 @@ import { createWorkerRouter } from "./lib/worker-router.mjs";
 import { createAnthropicClient } from "./lib/anthropic-client.mjs";
 import { createWorkerState } from "./lib/worker-state.mjs";
 import { createTokenHealthProbe } from "./lib/token-health-probe.mjs";
+import { createTokenHealthManager } from "./lib/token-health-manager.mjs";
 import { createCliRunner } from "./lib/cli-runner.mjs";
 import { createAdminRoutes } from "./lib/admin-routes.mjs";
 import { createRequestHandler } from "./lib/request-handler.mjs";
@@ -136,7 +137,18 @@ const ANTHROPIC_MODEL_IDS = CONFIG.anthropic.models;
 
 // Token pool for API direct — managed by lib/token-pool.mjs
 const TOKEN_POOL = buildTokenPool(_workerPool);
-const tokenPoolManager = createTokenPoolManager(TOKEN_POOL);
+// Token health manager: unified state machine for per-token health
+const tokenHealthManager = createTokenHealthManager({
+  tokenPool: TOKEN_POOL,
+  maxHealAttempts: 5,
+  deadBackoffMs: 1_800_000,   // 30 min
+  degradedProbeMs: 60_000,    // 1 min
+  healthyProbeMs: 300_000,    // 5 min
+  eventLog,
+  log: console.log,
+});
+
+const tokenPoolManager = createTokenPoolManager(TOKEN_POOL, { healthManager: tokenHealthManager });
 const { getNextToken, setTokenCooldown, getTokenCooldownMs, waitForTokenCooldown, captureUnifiedRateHeaders, getUnifiedRateLimits, getTokenRoutingSnapshot, markTokenAuthError, clearTokenAuthError } = tokenPoolManager;
 
 // ── Token refresher: auto-refresh OAuth tokens on 401 + proactive pre-expiry ──
@@ -160,6 +172,7 @@ const tokenHealthProbe = createTokenHealthProbe({
   setTokenCooldown,
   markTokenAuthError,
   clearTokenAuthError,
+  healthManager: tokenHealthManager,
   log: console.log,
 });
 
@@ -574,6 +587,7 @@ const metricsController = createMetricsController({
   getWorkerTokenReason: _getWorkerTokenReason,
   tokenHealthProbe,
   getTokenRoutingSnapshot: () => getTokenRoutingSnapshot(tokenHealthProbe?.getResults),
+  tokenHealthManager,
 });
 
 // Wire reaper events into event log + SSE
@@ -807,6 +821,7 @@ function getAnthropicClient() {
       sseBroadcast,
       markTokenAuthError,
       clearTokenAuthError,
+      healthManager: tokenHealthManager,
       log: console.log,
     });
   }

@@ -108,6 +108,15 @@
   .empty { color: var(--text2); text-align: center; padding: 12px; font-style: italic; font-size: 11px; }
 
   /* ── Tags ── */
+  /* Health badges */
+  .health-badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+  .health-badge.healthy { background: rgba(63,185,80,0.15); color: var(--green); }
+  .health-badge.degraded { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .health-badge.unhealthy { background: rgba(248,81,73,0.15); color: var(--red); }
+  .health-badge.dead { background: rgba(139,148,158,0.2); color: var(--text2); }
+  .worker-health-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+  .worker-health-row .wname { font-size: 12px; color: var(--text); font-weight: 500; min-width: 24px; }
+  .worker-health-row .werrors { font-size: 10px; color: var(--text2); }
   .tag { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 10px; font-weight: 500; }
   .tag.stream { background: #1f3a5f; color: var(--blue); }
   .tag.sync { background: #2a1f3f; color: var(--purple); }
@@ -612,6 +621,19 @@ async function refresh() {
     const qm = q.metrics;
     const sa = metrics.sessionAffinity || {};
     let qHtml = '';
+    // Token health badges
+    const ths = metrics.tokenHealthStates || {};
+    const thsKeys = Object.keys(ths);
+    if (thsKeys.length > 0) {
+      for (const tName of thsKeys) {
+        const st = ths[tName];
+        const hs = st.healthState || 'healthy';
+        const errs = st.consecutiveErrors || 0;
+        const errInfo = errs > 0 ? `<span class="werrors">${errs} err</span>` : '';
+        qHtml += `<div class="worker-health-row"><span class="wname">${tName}</span><span class="health-badge ${hs}">${hs}</span>${errInfo}</div>`;
+      }
+      qHtml += '<hr class="divider">';
+    }
     qHtml += `<div class="metric"><span class="lbl">active / max</span><span class="val" style="color:${q.active > 0 ? 'var(--blue)' : 'var(--green)'}">${q.active} / ${q.maxConcurrent}</span></div>`;
     qHtml += `<div class="metric"><span class="lbl">queued</span><span class="val" style="color:${q.totalQueued > 0 ? 'var(--yellow)' : ''}">${q.totalQueued}</span></div>`;
     qHtml += `<div class="metric"><span class="lbl">processed</span><span class="val">${qm.totalProcessed}</span></div>`;
