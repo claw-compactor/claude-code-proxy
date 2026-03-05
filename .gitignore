@@ -13,8 +13,13 @@ token_labels.json
 # Config with real tokens (use proxy.config.sample.json as template)
 proxy.config.json
 proxy.config.json.tmp
-proxy.config.json.bak*
-*.json.bak
+
+# Backup files
+*.bak
+*.bak_*
+
+# Test artifacts
+test/test-data-cache/
 
 # Environment / secrets
 .env*
