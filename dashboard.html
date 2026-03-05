@@ -201,6 +201,16 @@
   details summary::before { content: '▸'; font-size: 10px; transition: transform 0.2s; }
   details[open] summary::before { transform: rotate(90deg); }
   details .inner { padding: 0 14px 12px; }
+
+  /* ── Mobile ── */
+  @media (max-width: 600px) {
+    .tok-bar { flex-direction: column; }
+    .tok-cell { border-right: none; border-bottom: 1px solid var(--border); }
+    .workers-grid { flex-direction: column; }
+    .worker-card { min-width: 100%; }
+    .sessions-table { font-size: 11px; }
+    .header { flex-wrap: wrap; }
+  }
 </style>
 </head>
 <body>
@@ -274,10 +284,23 @@
     </div>
   </div>
 
+  <!-- Auto-Heal + Config -->
+  <div class="grid-2">
+    <div class="card">
+      <h2>Auto-Heal</h2>
+      <div id="autoheal-body"><div class="empty">loading...</div></div>
+    </div>
+    <details>
+      <summary>Config</summary>
+      <div class="inner" id="config-body"></div>
+    </details>
+  </div>
+
   <!-- Sessions -->
   <div class="card">
     <h2>Sessions <span class="cnt" id="sessions-count"></span></h2>
     <div class="scroll" id="sessions-body"><div class="empty">loading...</div></div>
+    <div id="sessions-pagination" style="display:flex;gap:8px;justify-content:center;padding:8px 0;font-size:11px"></div>
   </div>
 
   <!-- Live Stream + Processes -->
@@ -311,6 +334,8 @@ let lastEventId = 0;
 let startTime = Date.now();
 let currentWindow = '1h';
 let tokChart = null, reqChart = null;
+let sessionPage = 0;
+const SESSION_PAGE_SIZE = 25;
 
 // ── Helpers ──
 function fmt(ms) {
@@ -420,7 +445,7 @@ function fmtCountdown(sec) {
   return m + 'm';
 }
 
-function renderWorkerCard(name, traffic, router, tokenHealth, unified, activeConns, windowStats, enhanced) {
+function renderWorkerCard(name, traffic, router, tokenHealth, unified, activeConns, windowStats, enhanced, healthState) {
   const isLimited = router?.limited || false;
   const th = tokenHealth || {};
   const u = unified || {};
@@ -520,6 +545,31 @@ function renderWorkerCard(name, traffic, router, tokenHealth, unified, activeCon
     html += `<div class="wc-row"><span class="k">cooldown</span><span class="val r">${router.limitedRemainingSec}s remaining</span></div>`;
   }
 
+  // Token health state
+  const hs = healthState || {};
+  if (hs.healthState) {
+    html += '<hr class="wc-divider">';
+    html += `<div class="wc-row"><span class="k">token health</span><span class="health-badge ${hs.healthState}">${hs.healthState}</span></div>`;
+    if (hs.consecutiveErrors > 0) {
+      html += `<div class="wc-row"><span class="k">consecutive errors</span><span class="val r">${hs.consecutiveErrors}</span></div>`;
+    }
+    if (hs.lastProbeAt) {
+      html += `<div class="wc-row"><span class="k">last probe</span><span class="val">${fmt(Date.now() - hs.lastProbeAt)} ago</span></div>`;
+    }
+    if (hs.healAttempts > 0) {
+      html += `<div class="wc-row"><span class="k">heal attempts</span><span class="val y">${hs.healAttempts}</span></div>`;
+    }
+  }
+
+  // Auto-heal per-worker state
+  const ah = router?.autoHeal;
+  if (ah && ah.circuitState !== 'closed') {
+    html += `<div class="wc-row"><span class="k">heal circuit</span><span class="val r">${ah.circuitState}</span></div>`;
+    if (ah.circuitRemainingSec > 0) {
+      html += `<div class="wc-row"><span class="k">circuit resets</span><span class="val">${ah.circuitRemainingSec}s</span></div>`;
+    }
+  }
+
   html += '</div>';
   return html;
 }
@@ -528,7 +578,7 @@ function renderWorkerCard(name, traffic, router, tokenHealth, unified, activeCon
 async function refresh() {
   try {
     const [metrics, zombies, eventsData, reaperData] = await Promise.all([
-      fetchJson('/metrics'),
+      fetchJson('/metrics?sessions_limit=' + SESSION_PAGE_SIZE + '&sessions_offset=' + (sessionPage * SESSION_PAGE_SIZE)),
       fetchJson('/zombies'),
       fetchJson('/events?since_id=' + lastEventId + '&limit=100'),
       fetchJson('/system-reaper').catch(() => ({ stats: null })),
@@ -593,6 +643,7 @@ async function refresh() {
     // ── Worker Cards ──
     const routers = metrics.cliRouters || [];
     const routerMap = Object.fromEntries(routers.map(r => [r.name, r]));
+    const ths = metrics.tokenHealthStates || {};
     // Get all worker names from traffic + routers (union)
     const allWorkerNames = [...new Set([
       ...Object.keys(ws.traffic || {}),
@@ -609,6 +660,7 @@ async function refresh() {
         ac[name] || 0,
         wsWindow.traffic?.[name],
         rlEnhanced[name],
+        ths[name],
       );
     }
     if (allWorkerNames.length === 0) {
@@ -621,19 +673,6 @@ async function refresh() {
     const qm = q.metrics;
     const sa = metrics.sessionAffinity || {};
     let qHtml = '';
-    // Token health badges
-    const ths = metrics.tokenHealthStates || {};
-    const thsKeys = Object.keys(ths);
-    if (thsKeys.length > 0) {
-      for (const tName of thsKeys) {
-        const st = ths[tName];
-        const hs = st.healthState || 'healthy';
-        const errs = st.consecutiveErrors || 0;
-        const errInfo = errs > 0 ? `<span class="werrors">${errs} err</span>` : '';
-        qHtml += `<div class="worker-health-row"><span class="wname">${tName}</span><span class="health-badge ${hs}">${hs}</span>${errInfo}</div>`;
-      }
-      qHtml += '<hr class="divider">';
-    }
     qHtml += `<div class="metric"><span class="lbl">active / max</span><span class="val" style="color:${q.active > 0 ? 'var(--blue)' : 'var(--green)'}">${q.active} / ${q.maxConcurrent}</span></div>`;
     qHtml += `<div class="metric"><span class="lbl">queued</span><span class="val" style="color:${q.totalQueued > 0 ? 'var(--yellow)' : ''}">${q.totalQueued}</span></div>`;
     qHtml += `<div class="metric"><span class="lbl">processed</span><span class="val">${qm.totalProcessed}</span></div>`;
@@ -708,6 +747,39 @@ async function refresh() {
       sHtml = '<div class="empty">no session activity</div>';
     }
     document.getElementById('sessions-body').innerHTML = sHtml;
+    // Session pagination
+    const totalPages = Math.ceil((sessions.total || 0) / SESSION_PAGE_SIZE);
+    let pgHtml = '';
+    if (totalPages > 1) {
+      pgHtml += `<button onclick="sessionPage=Math.max(0,sessionPage-1);refresh()" ${sessionPage===0?'disabled':''} style="background:var(--bg3);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px">← Prev</button>`;
+      pgHtml += `<span style="color:var(--text2)">${sessionPage+1} / ${totalPages}</span>`;
+      pgHtml += `<button onclick="sessionPage=Math.min(${totalPages-1},sessionPage+1);refresh()" ${sessionPage>=totalPages-1?'disabled':''} style="background:var(--bg3);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px">Next →</button>`;
+    }
+    document.getElementById('sessions-pagination').innerHTML = pgHtml;
+
+    // ── Auto-Heal Summary ──
+    const ahStats = metrics.autoHeal || {};
+    let ahHtml = '';
+    ahHtml += `<div class="metric"><span class="lbl">triggered</span><span class="val ${ahStats.triggered > 0 ? 'y' : ''}">${ahStats.triggered || 0}</span></div>`;
+    ahHtml += `<div class="metric"><span class="lbl">success</span><span class="val g">${ahStats.success || 0}</span></div>`;
+    ahHtml += `<div class="metric"><span class="lbl">fail</span><span class="val ${ahStats.fail > 0 ? 'r' : ''}">${ahStats.fail || 0}</span></div>`;
+    if (ahStats.lastHealAt) {
+      ahHtml += `<div class="metric"><span class="lbl">last heal</span><span class="val">${fmt(Date.now() - ahStats.lastHealAt)} ago</span></div>`;
+    }
+    if (ahStats.lastHealReason) {
+      ahHtml += `<div class="metric"><span class="lbl">reason</span><span class="val">${ahStats.lastHealReason}</span></div>`;
+    }
+    document.getElementById('autoheal-body').innerHTML = ahHtml || '<div class="empty">no heal activity</div>';
+
+    // ── Config (collapsed) ──
+    let cfgHtml = '';
+    const cfgEntries = Object.entries(cfg);
+    const keyConfig = ['version', 'workerCount', 'maxConcurrent', 'useCliAgents'];
+    for (const [k, v] of cfgEntries) {
+      const val = typeof v === 'object' ? JSON.stringify(v) : String(v);
+      cfgHtml += `<div class="metric"><span class="lbl">${k}</span><span class="val" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${val}">${val}</span></div>`;
+    }
+    document.getElementById('config-body').innerHTML = cfgHtml || '<div class="empty">no config</div>';
 
     // ── Processes ──
     const allProcs = allProcsForLive;
@@ -848,7 +920,7 @@ setupTabs();
 initSSE();
 refresh();
 fetchHistory();
-setInterval(refresh, 2000);
+setInterval(refresh, 5000);
 setInterval(fetchHistory, 10000);
 </script>
 </body>
