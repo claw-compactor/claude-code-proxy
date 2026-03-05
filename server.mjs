@@ -143,8 +143,9 @@ const { getNextToken, setTokenCooldown, getTokenCooldownMs, waitForTokenCooldown
 const tokenRefresher = createTokenRefresher({
   tokenPool: TOKEN_POOL,
   configPath: join(__dirname, "proxy.config.json"),
-  proactiveMarginMs: 300_000, // 5 min before expiry
+  proactiveMarginMs: 3_600_000, // 1 hour before expiry (aggressive)
   maxBackoffMs: 300_000,
+  claudeBin: CLAUDE_BIN,
 });
 
 // ── Token health probe: periodic lightweight probes to verify token validity ──
