@@ -157,8 +157,18 @@ export function convertMessagesToAnthropic(openaiMessages) {
     if (msg.role === "assistant") {
       const content = [];
       if (msg.content) {
-        const text = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
-        if (text) content.push({ type: "text", text });
+        if (typeof msg.content === "string") {
+          if (msg.content) content.push({ type: "text", text: msg.content });
+        } else if (Array.isArray(msg.content)) {
+          for (const block of msg.content) {
+            if (block && typeof block === "object" && block.type === "text" && typeof block.text === "string") {
+              content.push({ type: "text", text: block.text });
+            }
+          }
+        } else {
+          const text = JSON.stringify(msg.content);
+          if (text) content.push({ type: "text", text });
+        }
       }
       if (Array.isArray(msg.tool_calls)) {
         for (const tc of msg.tool_calls) {

@@ -65,11 +65,64 @@ export async function createRedisClient(options = {}) {
 
   await client.connect();
 
+  // ── Write reliability: retry queue with exponential backoff ──
+  let _writeErrors = 0;
+  let _consecutiveWriteErrors = 0;
+  let _localOnlyMode = false;
+  const MAX_CONSECUTIVE_WRITE_ERRORS = 3;
+
+  /**
+   * Safe write with retry (up to 3 attempts, exponential backoff).
+   * After 3 consecutive failures, switches to local-only mode.
+   */
+  async function safeWrite(operation) {
+    if (_localOnlyMode) return null;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const result = await operation(client);
+        _consecutiveWriteErrors = 0;
+        return result;
+      } catch (err) {
+        _writeErrors++;
+        _consecutiveWriteErrors++;
+        if (attempt < 2) {
+          const delay = Math.pow(2, attempt) * 100; // 100ms, 200ms
+          await new Promise(r => setTimeout(r, delay));
+        }
+      }
+    }
+
+    // 3 consecutive failures → switch to local-only
+    if (_consecutiveWriteErrors >= MAX_CONSECUTIVE_WRITE_ERRORS) {
+      _localOnlyMode = true;
+      console.error(`[Redis] ⚠️ ${MAX_CONSECUTIVE_WRITE_ERRORS} consecutive write failures — switching to LOCAL-ONLY mode`);
+    }
+    return null;
+  }
+
+  function getWriteStats() {
+    return Object.freeze({
+      writeErrors: _writeErrors,
+      consecutiveWriteErrors: _consecutiveWriteErrors,
+      localOnlyMode: _localOnlyMode,
+    });
+  }
+
+  function resetLocalOnlyMode() {
+    _localOnlyMode = false;
+    _consecutiveWriteErrors = 0;
+    console.log("[Redis] Local-only mode reset — retrying writes");
+  }
+
   return Object.freeze({
     client,
     isReady: () => ready,
     quit: () => client.quit(),
     ping: () => client.ping(),
     prefix: config.keyPrefix,
+    safeWrite,
+    getWriteStats,
+    resetLocalOnlyMode,
   });
 }

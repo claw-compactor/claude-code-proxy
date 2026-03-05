@@ -11,8 +11,10 @@
  */
 
 import { request as httpsRequest } from "node:https";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, rename } from "node:fs/promises";
 import { execSync } from "node:child_process";
+import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
 
 // ── Constants ──
 const OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
@@ -135,6 +137,7 @@ export function createTokenRefresher({ tokenPool, configPath, proactiveMarginMs,
 
   // Per-token mutable state (keyed by token name)
   const _states = new Map();
+  const _liveTokens = new Map(); // tokenName -> current access token (no pool mutation)
 
   // Concurrent refresh coalescing (keyed by token name)
   const _pendingRefreshes = new Map();
@@ -222,9 +225,8 @@ export function createTokenRefresher({ tokenPool, configPath, proactiveMarginMs,
     };
     _states.set(tokenName, newState);
 
-    // Update TOKEN_POOL entry in-place (it's an array element, not frozen)
-    const poolEntry = tokenPool.find(t => t.name === tokenName);
-    if (poolEntry) poolEntry.token = result.accessToken;
+    // Store live token in internal map (avoid mutating TOKEN_POOL directly)
+    _liveTokens.set(tokenName, result.accessToken);
 
     // Persist to disk + keychain (fire-and-forget)
     persistToken(tokenName, result.accessToken, result.refreshToken, newExpiresAt).catch(err => {
@@ -257,8 +259,10 @@ export function createTokenRefresher({ tokenPool, configPath, proactiveMarginMs,
               : w
           ),
         };
-        await writeFile(configPath, JSON.stringify(updated, null, 2) + "\n");
-        logger.log(`[${ts()}] TOKEN_REFRESH persisted to config for ${tokenName}`);
+        const tmpPath = join(dirname(configPath), `.proxy.config.${randomUUID().slice(0, 8)}.tmp`);
+        await writeFile(tmpPath, JSON.stringify(updated, null, 2) + "\n");
+        await rename(tmpPath, configPath);
+        logger.log(`[${ts()}] TOKEN_REFRESH persisted to config for ${tokenName} (atomic write)`);
       }
     } catch (err) {
       logger.error(`[${ts()}] TOKEN_REFRESH config write failed: ${err.message}`);
@@ -342,6 +346,9 @@ export function createTokenRefresher({ tokenPool, configPath, proactiveMarginMs,
 
   // ── Public: Get active (possibly refreshed) token value ──
   function getActiveToken(tokenName) {
+    // Prefer _liveTokens (set on refresh), fall back to _states
+    const live = _liveTokens.get(tokenName);
+    if (live) return live;
     const state = _states.get(tokenName);
     return state ? state.currentAccessToken : null;
   }

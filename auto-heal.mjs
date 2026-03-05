@@ -71,6 +71,7 @@ export function createAutoHealManager({
   tokenPool,
   log = console,
   eventLog = null,
+  workerHealth = null, // optional: delegate circuit breaker to unified workerHealth
 } = {}) {
   const stats = {
     triggered: 0,
@@ -190,6 +191,8 @@ export function createAutoHealManager({
           state.circuitOpenUntil = nowFail + circuitOpenMs;
           workerStat.circuitOpenUntil = state.circuitOpenUntil;
         }
+        // Record failure to unified circuit breaker if available
+        workerHealth?.recordFailure(workerName, `auto_heal_fail:${reason}`);
         log.log(`[${ts()}] AUTO_HEAL_FAIL worker=${workerName} reason=${reason} reqId=${reqId} err=${err.message}`);
         if (eventLog) eventLog.push("auto_heal_fail", { worker: workerName, reason, reqId, error: err.message });
         return { attempted: true, success: false, reason, error: err.message };

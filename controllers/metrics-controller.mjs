@@ -24,6 +24,8 @@ export function createMetricsController({
   tokenRefresher,
   activeConnections = null,
   getWorkerTokenReason = null,
+  tokenHealthProbe = null,
+  getTokenRoutingSnapshot = null,
   logger = console,
 } = {}) {
   function computeWorkerWindowStats(windowMs = 60 * 60 * 1000) {
@@ -167,7 +169,9 @@ export function createMetricsController({
       })(),
       systemReaper: systemReaper.getStats(),
       unifiedRateLimits: getUnifiedRateLimits?.() || {},
+      rateLimitEnhanced: getTokenRoutingSnapshot?.() || {},
       tokenRefreshStatus: tokenRefresher?.getStatus?.() || null,
+      tokenProbe: tokenHealthProbe?.getResults?.() || {},
       generatedAt: ts(),
     };
   }

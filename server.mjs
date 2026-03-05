@@ -18,10 +18,10 @@
  * using the Max subscription (flat monthly fee, no per-token cost).
  */
 
-import { createServer, request as httpRequest } from "node:http";
-import { request as httpsRequest } from "node:https";
-import { spawn, execSync } from "node:child_process";
-import { randomUUID, createHash } from "node:crypto";
+import { createServer } from "node:http";
+// node:https moved to lib/anthropic-client.mjs
+import { execSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -47,6 +47,31 @@ import {
   completionResponse, completionResponseWithTools,
   convertToolsToAnthropic, convertMessagesToAnthropic,
 } from "./response-formats.mjs";
+import {
+  extractPrompt as _extractPrompt,
+  normalizeText as _normalizeText,
+  normalizeTextForKey as _normalizeTextForKey,
+  stableStringify,
+  hashString,
+  buildCacheKey,
+  splitSystemForCache as _splitSystemForCache,
+  buildCacheContext as _buildCacheContext,
+  buildAnthropicSystemBlocks as _buildAnthropicSystemBlocks,
+  buildUsage,
+  contentCharLen,
+  estimateAnthropicChars,
+  trimAnthropicMessages,
+} from "./lib/format-converter.mjs";
+import { buildTokenPool, createTokenPoolManager } from "./lib/token-pool.mjs";
+import { createFallbackClient } from "./lib/fallback-client.mjs";
+import { createWorkerRouter } from "./lib/worker-router.mjs";
+import { createAnthropicClient } from "./lib/anthropic-client.mjs";
+import { createWorkerState } from "./lib/worker-state.mjs";
+import { createTokenHealthProbe } from "./lib/token-health-probe.mjs";
+import { createCliRunner } from "./lib/cli-runner.mjs";
+import { createAdminRoutes } from "./lib/admin-routes.mjs";
+import { createRequestHandler } from "./lib/request-handler.mjs";
+import { anthropicToOpenAI, openAIToAnthropic, openAIStreamToAnthropic } from "./lib/anthropic-compat.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -109,129 +134,10 @@ const ANTHROPIC_API_VERSION = CONFIG.anthropic.apiVersion;
 
 const ANTHROPIC_MODEL_IDS = CONFIG.anthropic.models;
 
-// Token pool for API direct — least-utilization routing with round-robin tiebreaker.
-// Each token represents an independent OAuth credential with its own rate limits.
-// OAuth requires `anthropic-beta: oauth-2025-04-20` header to work with the raw API.
-const TOKEN_POOL = (() => {
-  const tokens = [];
-  // Worker tokens from config (each worker can have its own OAuth token)
-  for (const w of _workerPool) {
-    if (w.disabled) continue;
-    if (w.token) tokens.push({ name: w.name, token: w.token, type: "oauth_flat" });
-  }
-  // Fallback to process-level CLAUDE_CODE_OAUTH_TOKEN (env only — not in config file for security)
-  if (tokens.length === 0) {
-    const oat = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-    if (oat) tokens.push({ name: "default", token: oat, type: "oauth_flat" });
-  }
-  // Last resort: API key (per-token billing, env only)
-  if (tokens.length === 0) {
-    const key = process.env.ANTHROPIC_API_KEY;
-    if (key) tokens.push({ name: "apikey", token: key, type: "api_key_billed" });
-  }
-  return tokens;
-})();
-let _tokenRrIndex = 0;
-/**
- * Pick the best token: least-utilization first, round-robin as tiebreaker.
- *
- * Priority order:
- *   1. Skip tokens in cooldown (429 backoff)
- *   2. Among available tokens, pick the one with lowest 5h utilization %
- *   3. Ties broken by round-robin index for fairness
- *   4. If no utilization data yet (cold start), fall back to pure round-robin
- */
-function getNextToken() {
-  if (TOKEN_POOL.length <= 1) return TOKEN_POOL[0];
-
-  const now = Date.now();
-  const rrBase = _tokenRrIndex++;
-
-  // Build candidates with utilization scores
-  const candidates = TOKEN_POOL.map((entry, idx) => {
-    const cooldownUntil = _tokenCooldowns.get(entry.name) || 0;
-    const inCooldown = cooldownUntil > now;
-    const rl = _unifiedRateLimits.get(entry.name);
-    // Use 5h utilization as primary score (0-1), fallback to 0 if unknown
-    const utilization = rl ? rl.h5Utilization : -1; // -1 = no data yet
-    return { entry, idx, inCooldown, utilization };
-  });
-
-  // Separate available from cooled-down
-  const available = candidates.filter(c => !c.inCooldown);
-  const pool = available.length > 0 ? available : candidates; // if all cooled, pick least cooldown
-
-  // Check if we have ANY utilization data
-  const hasData = pool.some(c => c.utilization >= 0);
-
-  if (!hasData) {
-    // Cold start: pure round-robin
-    const idx = rrBase % TOKEN_POOL.length;
-    return TOKEN_POOL[idx];
-  }
-
-  // Sort: lowest utilization first, round-robin index as tiebreaker
-  pool.sort((a, b) => {
-    // Tokens without data go last
-    if (a.utilization < 0 && b.utilization >= 0) return 1;
-    if (b.utilization < 0 && a.utilization >= 0) return -1;
-    // Lower utilization = better
-    const diff = a.utilization - b.utilization;
-    if (Math.abs(diff) > 0.001) return diff;
-    // Tiebreaker: distribute evenly via round-robin offset
-    return ((a.idx - rrBase % pool.length) + pool.length) % pool.length
-         - ((b.idx - rrBase % pool.length) + pool.length) % pool.length;
-  });
-
-  return pool[0].entry;
-}
-
-// Token cooldowns for Anthropic API direct (per OAuth token)
-const _tokenCooldowns = new Map(); // name -> unix ms
-function setTokenCooldown(tokenEntry, ms, reason) {
-  const until = Date.now() + ms;
-  _tokenCooldowns.set(tokenEntry.name, until);
-  console.log(`[${ts()}] TOKEN_COOLDOWN_SET token=${tokenEntry.name} ms=${ms} reason=${reason || ""}`);
-}
-function getTokenCooldownMs(tokenEntry) {
-  const until = _tokenCooldowns.get(tokenEntry.name) || 0;
-  return Math.max(0, until - Date.now());
-}
-async function waitForTokenCooldown(tokenEntry) {
-  let waitMs = getTokenCooldownMs(tokenEntry);
-  while (waitMs > 0) {
-    const sleepMs = Math.min(waitMs, 5000);
-    console.log(`[${ts()}] TOKEN_COOLDOWN token=${tokenEntry.name} waiting ${sleepMs}ms`);
-    await new Promise((r) => setTimeout(r, sleepMs));
-    waitMs = getTokenCooldownMs(tokenEntry);
-  }
-}
-
-// ── Unified rate limit tracking (per-token, from Anthropic response headers) ──
-const _unifiedRateLimits = new Map(); // tokenName -> { status, 5hUtilization, 7dUtilization, fallbackPct, overageStatus, orgId, updatedAt }
-function captureUnifiedRateHeaders(apiRes, tokenEntry) {
-  const h = apiRes.headers;
-  const data = {
-    status: h["anthropic-ratelimit-unified-status"] || null,
-    h5Status: h["anthropic-ratelimit-unified-5h-status"] || null,
-    h5Utilization: parseFloat(h["anthropic-ratelimit-unified-5h-utilization"]) || 0,
-    d7Status: h["anthropic-ratelimit-unified-7d-status"] || null,
-    d7Utilization: parseFloat(h["anthropic-ratelimit-unified-7d-utilization"]) || 0,
-    fallbackPct: parseFloat(h["anthropic-ratelimit-unified-fallback-percentage"]) || 1,
-    overageStatus: h["anthropic-ratelimit-unified-overage-status"] || null,
-    orgId: h["anthropic-organization-id"] || null,
-    representative: h["anthropic-ratelimit-unified-representative-claim"] || null,
-    updatedAt: Date.now(),
-  };
-  _unifiedRateLimits.set(tokenEntry.name, data);
-}
-function getUnifiedRateLimits() {
-  const result = {};
-  for (const [name, data] of _unifiedRateLimits) {
-    result[name] = { ...data };
-  }
-  return result;
-}
+// Token pool for API direct — managed by lib/token-pool.mjs
+const TOKEN_POOL = buildTokenPool(_workerPool);
+const tokenPoolManager = createTokenPoolManager(TOKEN_POOL);
+const { getNextToken, setTokenCooldown, getTokenCooldownMs, waitForTokenCooldown, captureUnifiedRateHeaders, getUnifiedRateLimits, getTokenRoutingSnapshot } = tokenPoolManager;
 
 // ── Token refresher: auto-refresh OAuth tokens on 401 + proactive pre-expiry ──
 const tokenRefresher = createTokenRefresher({
@@ -239,6 +145,19 @@ const tokenRefresher = createTokenRefresher({
   configPath: join(__dirname, "proxy.config.json"),
   proactiveMarginMs: 300_000, // 5 min before expiry
   maxBackoffMs: 300_000,
+});
+
+// ── Token health probe: periodic lightweight probes to verify token validity ──
+const tokenHealthProbe = createTokenHealthProbe({
+  tokenPool: TOKEN_POOL,
+  apiBase: ANTHROPIC_API_BASE,
+  apiVersion: ANTHROPIC_API_VERSION,
+  modelIds: ANTHROPIC_MODEL_IDS,
+  intervalMs: 300_000, // 5 min
+  tokenRefresher,
+  captureUnifiedRateHeaders,
+  setTokenCooldown,
+  log: console.log,
 });
 
 // Backward compat: ANTHROPIC_AUTH still used for logging/health checks
@@ -349,88 +268,10 @@ function getSessionIdForStats(req) {
 
 // load balance mode managed by WorkerHealthController
 
-// Active connection tracking — for least-connections routing
-const _activeConns = new Map(_workerPool.map(w => [w.name, 0]));
-function workerAcquire(name) { _activeConns.set(name, (_activeConns.get(name) || 0) + 1); }
-function workerRelease(name) { const v = _activeConns.get(name) || 0; _activeConns.set(name, Math.max(0, v - 1)); }
-// Round-robin tiebreaker index — prevents pool[0] bias when workers have equal load
-let _leastLoadedRrIndex = 0;
-function leastLoadedWorker(pool) {
-  // Collect candidates with identical (conns, totalRequests) as the minimum
-  let minConns = Infinity;
-  let minTotal = Infinity;
-  // First pass: find the minimum (conns, total) pair
-  for (const w of pool) {
-    const c = _activeConns.get(w.name) ?? 0;
-    const t = workerStats.traffic[w.name]?.requests ?? 0;
-    if (c < minConns || (c === minConns && t < minTotal)) {
-      minConns = c;
-      minTotal = t;
-    }
-  }
-  // Second pass: collect all workers tied at the minimum
-  const tied = pool.filter(w => {
-    const c = _activeConns.get(w.name) ?? 0;
-    const t = workerStats.traffic[w.name]?.requests ?? 0;
-    return c === minConns && t === minTotal;
-  });
-  // Round-robin among tied candidates (avoids pool[0] bias)
-  if (tied.length === 1) return tied[0];
-  const pick = tied[_leastLoadedRrIndex % tied.length];
-  _leastLoadedRrIndex = (_leastLoadedRrIndex + 1) % tied.length;
-  return pick;
-}
-
-/**
- * Get the next worker, respecting session affinity when available.
- *
- * @param {string} [sessionKey] - Session key for affinity lookup
- * @returns {object} worker from _workerPool
- */
-function getNextWorker(sessionKey) {
-  const isHealthy = (name) => workerHealth?.isHealthy(name);
-  const enabled = _enabledWorkers();
-  const pool = enabled.length > 0 ? enabled : _workerPool;
-  const healthy = pool.filter((w) => isHealthy(w.name));
-
-  if (healthy.length === 0) {
-    // All workers limited — pick the one that was limited longest ago
-    const sorted = [...pool].sort(
-      (a, b) => (workerHealth?.getState(a.name)?.limitedAt || 0) - (workerHealth?.getState(b.name)?.limitedAt || 0),
-    );
-    console.log(`[CLIRouter] ALL LIMITED — trying oldest-limited: ${sorted[0].name}`);
-    return sorted[0];
-  }
-
-  if (healthy.length === 1) {
-    return healthy[0];
-  }
-
-  // Degraded mode: only use primary
-  if (!workerHealth?.getLoadBalanceMode()) {
-    const primary = healthy.find((w) => w.name === PRIMARY_WORKER);
-    return primary || healthy[0];
-  }
-
-  // --- Least-connections is primary strategy ---
-  // Session affinity is only a tiebreaker when workers have equal load.
-  const least = leastLoadedWorker(healthy);
-  const leastConns = _activeConns.get(least.name) || 0;
-
-  if (sessionKey) {
-    const aff = sessionAffinity.lookup(sessionKey, isHealthy);
-    if (aff?.hit) {
-      const affinityWorker = pool.find((w) => w.name === aff.workerName);
-      if (affinityWorker) {
-        const affConns = _activeConns.get(affinityWorker.name) || 0;
-        // Use affinity only if it's strictly less loaded (not just equal)
-        if (affConns < leastConns) return affinityWorker;
-      }
-    }
-  }
-
-  return least;
-}
+// Worker routing — managed by lib/worker-router.mjs (initialized after workerHealth + sessionAffinity)
+let workerRouter = null; // set after module init below
+// Forward declarations to bridge with workerRouter (set after initialization)
+let getNextWorker, workerAcquire, workerRelease;
 
 function markWorkerLimited(workerName, errText = "") {
   workerHealth?.markLimited(workerName, errText);
@@ -659,6 +500,7 @@ const autoHeal = createAutoHealManager({
   tokenRefresher,
   tokenPool: TOKEN_POOL,
   eventLog,
+  workerHealth, // unified circuit breaker
 });
 
 // System reaper: periodic cleanup of orphan OS processes
@@ -666,6 +508,30 @@ const systemReaper = createSystemReaper(CONFIG.systemReaper);
 
 // Session affinity: sticky routing for conversation sessions
 const sessionAffinity = createSessionAffinity({ ttlMs: CONFIG.sessionAffinity?.ttlMs ?? 30 * 60 * 1000 });
+
+// Worker router: least-connections with session affinity tiebreaker
+workerRouter = createWorkerRouter({
+  workerPool: _workerPool,
+  primaryWorker: PRIMARY_WORKER,
+  getWorkerHealth: () => workerHealth,
+  getSessionAffinity: () => sessionAffinity,
+  workerStats,
+  getUnifiedRateLimits,
+});
+getNextWorker = workerRouter.getNextWorker;
+workerAcquire = workerRouter.workerAcquire;
+workerRelease = workerRouter.workerRelease;
+const _activeConns = workerRouter.getActiveConnections();
+
+// Worker state: runtime disable/enable with graceful drain
+const workerState = createWorkerState({
+  workerPool: _workerPool,
+  configPath: join(__dirname, "proxy.config.json"),
+  getActiveConns: (name) => _activeConns.get(name) || 0,
+  drainTimeoutMs: 60_000,
+  eventLog,
+  log: (msg) => console.log(`[${ts()}] ${msg}`),
+});
 
 // Warm worker pool: pre-spawns CLI processes to eliminate 2-5s cold start
 const warmPool = createWarmPool({
@@ -676,6 +542,14 @@ const warmPool = createWarmPool({
   buildEnv: (worker) => workerEnv(worker),
   log: (msg) => console.log(`[${ts()}] ${msg}`),
 });
+
+function _getWorkerTokenReason(worker) {
+  const now = Date.now();
+  if (worker.disabled) return worker.disabledReason || "disabled";
+  if (!worker.token && !worker.refreshToken) return "no token";
+  if (worker.expiresAt && worker.expiresAt > 0 && worker.expiresAt <= now) return "expired";
+  return null;
+}
 
 const metricsController = createMetricsController({
   metricsStore,
@@ -694,7 +568,9 @@ const metricsController = createMetricsController({
   getUnifiedRateLimits,
   tokenRefresher,
   activeConnections: _activeConns,
-  getWorkerTokenReason,
+  getWorkerTokenReason: _getWorkerTokenReason,
+  tokenHealthProbe,
+  getTokenRoutingSnapshot: () => getTokenRoutingSnapshot(tokenHealthProbe?.getResults),
 });
 
 // Wire reaper events into event log + SSE
@@ -739,6 +615,7 @@ systemReaper.onReap((result) => {
 
 // Start the system reaper periodic sweep
 systemReaper.start();
+
 
 // ============================================================
 // SSE Broadcast — real-time stream to dashboard subscribers
@@ -785,6 +662,7 @@ function gatherMetricsSnapshot() {
     systemReaper: systemReaper.getStats(),
     cache: getCacheStats(),
     warmPool: warmPool.status(),
+    tokenProbe: tokenHealthProbe.getResults(),
   };
 }
 
@@ -832,470 +710,28 @@ const CACHE_NORMALIZE_SYSTEM_PREFIX = CONFIG.cacheControl?.normalizeSystemPrefix
 const CACHE_DEBOUNCE_WHITESPACE = CONFIG.cacheControl?.debounceWhitespace ?? true;
 const CACHE_SESSION_SCOPE = CONFIG.cacheControl?.sessionScope ?? "x-session-id"; // "x-session-id" | "none"
 
-function extractPrompt(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return { prompt: "", systemPrompt: null };
-  }
+// ── Format converter wrappers: bind config to extracted pure functions ──
+const _cacheConfig = Object.freeze({
+  enabled: CACHE_CONTROL_ENABLED,
+  systemPrefixChars: CACHE_SYSTEM_PREFIX_CHARS,
+  minSystemPrefixChars: CACHE_SYSTEM_MIN_PREFIX_CHARS,
+  normalizeSystemPrefix: CACHE_NORMALIZE_SYSTEM_PREFIX,
+  debounceWhitespace: CACHE_DEBOUNCE_WHITESPACE,
+  sessionScope: CACHE_SESSION_SCOPE,
+});
+function extractPrompt(messages) { return _extractPrompt(messages, MAX_PROMPT_CHARS); }
+function buildCacheContext(args) { return _buildCacheContext({ ...args, cacheConfig: _cacheConfig }); }
+function buildAnthropicSystemBlocks(systemText, cacheCtx) { return _buildAnthropicSystemBlocks(systemText, cacheCtx, _cacheConfig); }
 
-  let systemPrompt = null;
-  const systemMsg = messages.find((m) => m.role === "system" || m.role === "developer");
-  if (systemMsg) {
-    systemPrompt = typeof systemMsg.content === "string"
-      ? systemMsg.content
-      : JSON.stringify(systemMsg.content);
-  }
-
-  // Collect all non-system messages
-  const allParts = [];
-  for (const msg of messages) {
-    if (msg.role === "system" || msg.role === "developer") continue;
-    const text = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
-    if (msg.role === "user") allParts.push(text);
-    else if (msg.role === "assistant") allParts.push(`[Previous assistant]: ${text}`);
-  }
-
-  // Truncate from the front (keep recent messages) to fit within MAX_PROMPT_CHARS.
-  // Always keep the LAST message (the actual user request).
-  let totalLen = 0;
-  const kept = [];
-  for (let i = allParts.length - 1; i >= 0; i--) {
-    const part = allParts[i];
-    if (totalLen + part.length > MAX_PROMPT_CHARS && kept.length > 0) {
-      // Budget exceeded — prepend a truncation notice and stop
-      kept.unshift("[... earlier conversation history truncated ...]");
-      break;
-    }
-    totalLen += part.length;
-    kept.unshift(part);
-  }
-
-  return { prompt: kept.join("\n\n"), systemPrompt };
-}
-
-// ── Cache-control helpers (Anthropic prompt caching) ──
-function normalizeText(text) {
-  const raw = String(text || "");
-  if (!CACHE_NORMALIZE_SYSTEM_PREFIX) return raw;
-  let normalized = raw.replace(/\r\n/g, "\n");
-  if (CACHE_DEBOUNCE_WHITESPACE) {
-    normalized = normalized
-      .replace(/[ \t]+/g, " ")
-      .replace(/\n[ \t]+/g, "\n")
-      .replace(/\n{3,}/g, "\n\n");
-  }
-  return normalized.trim();
-}
-
-function normalizeTextForKey(text) {
-  const base = normalizeText(text);
-  if (!CACHE_NORMALIZE_SYSTEM_PREFIX) return base;
-  if (!CACHE_DEBOUNCE_WHITESPACE) return base;
-  return base.replace(/\s+/g, " ").trim();
-}
-function stableStringify(obj) {
-  if (obj === null || typeof obj !== "object") return JSON.stringify(obj);
-  if (Array.isArray(obj)) return `[${obj.map(stableStringify).join(",")}]`;
-  const keys = Object.keys(obj).sort();
-  return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
-}
-function hashString(str) {
-  return createHash("sha256").update(str).digest("hex").slice(0, 16);
-}
-function buildCacheKey({ tenant, sessionId, model, systemPrefixHash, toolsHash }) {
-  return `t:${tenant}|s:${sessionId || "none"}|m:${model}|sp:${systemPrefixHash}|th:${toolsHash}`;
-}
-function splitSystemForCache(systemText) {
-  const normalized = normalizeText(systemText);
-  const keyNormalized = normalizeTextForKey(systemText);
-  if (!normalized) return { normalized: "", prefix: "", suffix: "", cacheable: false, keyPrefix: "" };
-  const prefixLen = Math.min(CACHE_SYSTEM_PREFIX_CHARS, normalized.length);
-  if (prefixLen < CACHE_SYSTEM_MIN_PREFIX_CHARS) {
-    return { normalized, prefix: "", suffix: normalized, cacheable: false, keyPrefix: "" };
-  }
-  const prefix = normalized.slice(0, prefixLen);
-  const suffix = normalized.slice(prefixLen);
-  const keyPrefix = keyNormalized ? keyNormalized.slice(0, Math.min(prefixLen, keyNormalized.length)) : "";
-  return { normalized, prefix, suffix, cacheable: true, keyPrefix };
-}
 function getSessionIdFromRequest(req, body) {
   return req?.headers?.["x-session-id"] || body?.session_id || "";
 }
 
-function buildCacheContext({ body, model, source, req, applyCacheControl }) {
-  const tenant = req?.headers?.["x-tenant-id"] || req?.headers?.["x-openclaw-tenant"] || source || "unknown";
-  const sessionId = CACHE_SESSION_SCOPE === "none"
-    ? ""
-    : (req?.headers?.["x-session-id"] || body?.session_id || "");
-  const systemPrompt = (() => {
-    const systemMsg = (body?.messages || []).find((m) => m.role === "system" || m.role === "developer");
-    if (!systemMsg) return "";
-    return typeof systemMsg.content === "string" ? systemMsg.content : JSON.stringify(systemMsg.content);
-  })();
-  const { normalized, prefix, suffix, cacheable, keyPrefix } = splitSystemForCache(systemPrompt);
-  const toolsSchema = body?.tools ? stableStringify(body.tools) : "";
-  const toolsHash = toolsSchema ? hashString(toolsSchema) : "none";
-  const systemPrefixHash = keyPrefix ? hashString(keyPrefix) : "none";
-  const cacheKey = buildCacheKey({ tenant, sessionId, model, systemPrefixHash, toolsHash });
-  const cacheKeyHash = hashString(cacheKey);
-  const candidateCount = prefix ? 1 : 0;
-  const appliedCount = applyCacheControl && CACHE_CONTROL_ENABLED && cacheable ? 1 : 0;
-  let reason = "ok";
-  if (!CACHE_CONTROL_ENABLED) reason = "cache_control_disabled";
-  else if (!normalized) reason = "no_system";
-  else if (!cacheable) reason = "system_prefix_too_short";
-  else if (!applyCacheControl) reason = "cache_control_not_applied";
-  if (CACHE_SESSION_SCOPE === "none") reason = `${reason}|session_scope=none`;
-  return {
-    tenant,
-    sessionId,
-    systemNormalized: normalized,
-    systemPrefix: prefix,
-    systemSuffix: suffix,
-    cacheableSystem: cacheable,
-    cacheKey,
-    cacheKeyHash,
-    candidateCount,
-    appliedCount,
-    toolsHash,
-    reason,
-  };
-}
-function buildAnthropicSystemBlocks(systemText, cacheCtx) {
-  if (!systemText) return null;
-  const { normalized, prefix, suffix, cacheable } = splitSystemForCache(systemText);
-  if (CACHE_CONTROL_ENABLED && cacheable && cacheCtx?.appliedCount > 0 && prefix) {
-    const blocks = [{ type: "text", text: prefix, cache_control: { type: "ephemeral" } }];
-    if (suffix) blocks.push({ type: "text", text: suffix });
-    return blocks;
-  }
-  return [{ type: "text", text: normalized }];
-}
+// CLI runner — extracted to lib/cli-runner.mjs (initialized after all deps are ready, see below)
 
-function buildUsage({ inputTokens = 0, outputTokens = 0, cacheCreation = 0, cacheRead = 0 } = {}) {
-  const totalInput = inputTokens + cacheCreation + cacheRead;
-  return {
-    input_tokens: inputTokens,
-    output_tokens: outputTokens,
-    cache_creation_input_tokens: cacheCreation,
-    cache_read_input_tokens: cacheRead,
-    prompt_tokens: totalInput,
-    completion_tokens: outputTokens,
-    total_tokens: totalInput + outputTokens,
-  };
-}
-
-// --- Anthropic Direct API context guard (approximate token count) ---
-function contentCharLen(block) {
-  if (!block) return 0;
-  if (block.type === "text") return (block.text || "").length;
-  if (block.type === "tool_result") return String(block.content || "").length;
-  if (block.type === "tool_use") return (block.name || "").length + JSON.stringify(block.input || {}).length;
-  try { return JSON.stringify(block).length; } catch { return 0; }
-}
-
-function estimateAnthropicChars(system, messages) {
-  let chars = system ? system.length : 0;
-  for (const msg of messages || []) {
-    if (Array.isArray(msg.content)) {
-      for (const block of msg.content) chars += contentCharLen(block);
-    } else if (msg.content) {
-      chars += String(msg.content).length;
-    }
-  }
-  return chars;
-}
-
-function truncateContentBlock(block, budget) {
-  if (!block || budget <= 0) return null;
-  if (block.type === "text") return { ...block, text: (block.text || "").slice(-budget) };
-  if (block.type === "tool_result") return { ...block, content: String(block.content || "").slice(-budget) };
-  return null;
-}
-
-function trimAnthropicMessages(system, messages, maxTokens) {
-  const maxChars = Math.floor(maxTokens * APPROX_CHARS_PER_TOKEN);
-  let working = Array.isArray(messages) ? messages.map(m => ({ ...m, content: Array.isArray(m.content) ? [...m.content] : m.content })) : [];
-  let beforeChars = estimateAnthropicChars(system, working);
-  if (beforeChars <= maxChars) return { system, messages: working, truncated: false, beforeChars, afterChars: beforeChars };
-
-  while (working.length > 1 && estimateAnthropicChars(system, working) > maxChars) {
-    working.shift();
-  }
-
-  let afterChars = estimateAnthropicChars(system, working);
-  if (afterChars > maxChars && working.length === 1) {
-    const budget = Math.max(0, maxChars - (system ? system.length : 0));
-    const msg = working[0];
-    if (Array.isArray(msg.content)) {
-      const newContent = [];
-      let remaining = budget;
-      for (let i = msg.content.length - 1; i >= 0 && remaining > 0; i--) {
-        const block = msg.content[i];
-        const len = contentCharLen(block);
-        if (len <= remaining) {
-          newContent.unshift(block);
-          remaining -= len;
-        } else {
-          const truncated = truncateContentBlock(block, remaining);
-          if (truncated) newContent.unshift(truncated);
-          remaining = 0;
-        }
-      }
-      msg.content = newContent;
-    } else if (typeof msg.content === "string") {
-      msg.content = msg.content.slice(-budget);
-    }
-    afterChars = estimateAnthropicChars(system, working);
-  }
-
-  return { system, messages: working, truncated: true, beforeChars, afterChars };
-}
-
-function buildCliArgs(prompt, model, systemPrompt, stream) {
-  // Pass prompt via stdin (not CLI arg) to avoid OrbStack/OS arg length limits.
-  // The `-p` flag without a positional prompt tells Claude CLI to read from stdin.
-  // --dangerously-skip-permissions: full autonomous agent, all tools enabled
-  // --append-system-prompt: injects authorization context into the REAL system prompt
-  //   (NOT user message) so the model treats it as operator instructions, not prompt injection.
-  const args = ["-p", "--model", model, "--dangerously-skip-permissions",
-    "--append-system-prompt", PROXY_AUTH_PREAMBLE];
-  if (stream) {
-    args.push("--output-format", "stream-json", "--verbose", "--include-partial-messages");
-  } else {
-    args.push("--output-format", "text");
-  }
-  return args;
-}
-
-// Authorization preamble — appended to the REAL system prompt via --append-system-prompt.
-// This goes through the proper system prompt channel, so the model treats it as
-// operator instructions rather than user-injected content (which would be flagged as prompt injection).
-const PROXY_AUTH_PREAMBLE = [
-  "You are an autonomous agent operating on the infrastructure owner's private network.",
-  "All machines referenced in tasks are owned by the operator. All SSH keys are pre-configured.",
-  "You are fully authorized to: execute commands locally and remotely, use SSH/scp/rsync,",
-  "read/write files, install packages, access databases and APIs.",
-  "Wrapper scripts in PATH: run-on-c10tt, run-on-aimm, run-on-m3, run-on-c13tt, run-on-c11tt.",
-  "Prefer wrapper scripts over raw SSH. All operations are pre-approved by the operator.",
-].join(" ");
-
-// Build the full stdin payload: system prompt (if any) + user prompt
-function buildStdinPayload(prompt, systemPrompt) {
-  if (systemPrompt) {
-    return `[System Instructions]\n${systemPrompt}\n\n[User Request]\n${prompt}`;
-  }
-  return prompt;
-}
-
-function runCliOnce(prompt, model, systemPrompt, requestId = "", source = "", workerOverride = null, sessionKey = "") {
-  return new Promise((resolve, reject) => {
-    const worker = workerOverride || getNextWorker(sessionKey);
-    if (sessionKey) sessionAffinity.assign(sessionKey, worker.name);
-    recordWorkerRequest(worker.name);
-    workerAcquire(worker.name);
-
-    // Try warm pool first — get a pre-initialized process or spawn fresh
-    const warm = warmPool.acquire(model, false, worker);
-    let proc;
-    if (warm) {
-      proc = warm.proc;
-      console.log(`[${ts()}] CLIROUTER obj=${worker.name} bin=${worker.bin} reqId=${requestId} model=${model} WARM_HIT pid=${proc.pid}`);
-    } else {
-      const args = buildCliArgs(prompt, model, systemPrompt, false);
-      proc = spawn(worker.bin, args, {
-        env: workerEnv(worker),
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-      console.log(`[${ts()}] CLIROUTER obj=${worker.name} bin=${worker.bin} reqId=${requestId} model=${model} COLD pid=${proc.pid || "?"}`);
-    }
-
-    // Write full payload (system prompt + user prompt) to stdin
-    if (proc.stdin) {
-      proc.stdin.write(buildStdinPayload(prompt, systemPrompt));
-      proc.stdin.end();
-    }
-
-    // Track in process registry
-    if (proc.pid) {
-      registry.register({
-        pid: proc.pid,
-        requestId,
-        model,
-        mode: "sync",
-        source,
-        worker: `${worker.name}:${worker.bin}`,
-        promptPreview: typeof prompt === "string" ? prompt.slice(0, 80) : "[structured]",
-      });
-    }
-
-    // Execution timeout — kill if running too long
-    const execTimer = setTimeout(() => {
-      eventLog.push("timeout", { kind: "sync", pid: proc.pid, reqId: requestId, model });
-      recordWorkerError(worker.name, "timeout", `sync_timeout pid=${proc.pid}`);
-      console.log(`[${ts()}] SYNC_TIMEOUT pid=${proc.pid} reqId=${requestId} model=${model}`);
-      try { proc.kill("SIGTERM"); } catch { /* ignore */ }
-      const err = new Error(`Execution timeout after ${SYNC_TIMEOUT_MS}ms`);
-      err.exitCode = -1;
-      err.workerName = worker.name;
-      err.isTimeout = true;
-      reject(err);
-    }, SYNC_TIMEOUT_MS);
-
-    let stdout = "";
-    let stderr = "";
-    proc.stdout.on("data", (d) => {
-      stdout += d.toString();
-      if (proc.pid) registry.touch(proc.pid);
-    });
-    proc.stderr.on("data", (d) => { stderr += d.toString(); });
-    proc.on("close", (code) => {
-      clearTimeout(execTimer);
-      workerRelease(worker.name);
-      if (proc.pid) registry.unregister(proc.pid);
-      // Detect rate limit from stderr/stdout
-      const rateErr = isRateLimitError(code, stderr) || isRateLimitError(code, stdout);
-      if (rateErr) {
-        markWorkerLimited(worker.name, stderr || stdout);
-      }
-      if (code !== 0) {
-        const err = new Error(`CLI exit ${code}: ${stderr}`);
-        err.exitCode = code;
-        err.workerName = worker.name;
-        err.isRateLimit = rateErr;
-        err.stderr = stderr;
-        err.stdout = stdout;
-        reject(err);
-      } else {
-        resolve(stdout.trim());
-      }
-    });
-    proc.on("error", (err) => {
-      clearTimeout(execTimer);
-      workerRelease(worker.name);
-      if (proc.pid) registry.unregister(proc.pid);
-      err.workerName = worker.name;
-      reject(err);
-    });
-  });
-}
-
-/**
- * Run CLI with retry + exponential backoff + jitter.
- * Uses retry policy for consistent retry behavior.
- */
-async function runCli(prompt, model, systemPrompt, requestId = "", source = "", sessionKey = "") {
-  const primaryWorker = getNextWorker(sessionKey);
-  const autoHealRetries = CONFIG.autoHeal?.maxRetriesPerRequest ?? 1;
-
-  try {
-    return await runCliOnce(prompt, model, systemPrompt, requestId, source, primaryWorker, sessionKey);
-  } catch (err) {
-    const classification = classifyCliError({
-      exitCode: err.exitCode,
-      stderr: err.stderr,
-      stdout: err.stdout,
-      err,
-    });
-
-    if (classification.healable && CONFIG.autoHeal?.enabled !== false) {
-      const healResult = await autoHeal.heal(primaryWorker.name, classification.reason, requestId);
-      if (healResult?.success) {
-        let lastErr = null;
-        for (let i = 0; i < autoHealRetries; i++) {
-          try {
-            return await runCliOnce(prompt, model, systemPrompt, requestId, source, primaryWorker, sessionKey);
-          } catch (retryErr) {
-            lastErr = retryErr;
-          }
-        }
-        const alt = getAlternateWorker(primaryWorker.name);
-        if (alt) {
-          return await runCliOnce(prompt, model, systemPrompt, requestId, source, alt, sessionKey);
-        }
-        throw lastErr || err;
-      }
-
-      const alt = getAlternateWorker(primaryWorker.name);
-      if (alt) {
-        return await runCliOnce(prompt, model, systemPrompt, requestId, source, alt, sessionKey);
-      }
-      throw err;
-    }
-
-    return retryPolicy.withRetry(
-      () => runCliOnce(prompt, model, systemPrompt, requestId, source, null, sessionKey),
-      {
-        maxRetries: Math.max(0, MAX_RETRIES - 1),
-        onRetry: (attempt, error, delayMs) => {
-          eventLog.push("retry", { reqId: requestId, attempt: attempt + 1, model, delay: delayMs, error: error.message });
-          console.log(
-            `[${ts()}] RETRY attempt=${attempt + 1}/${MAX_RETRIES} ` +
-            `model=${model} delay=${delayMs}ms err=${error.message}`
-          );
-        },
-      },
-    );
-  }
-}
-
-function spawnCliStream(prompt, model, systemPrompt, worker) {
-  // Try warm pool first
-  const warm = warmPool.acquire(model, true, worker);
-  let proc;
-  if (warm) {
-    proc = warm.proc;
-    console.log(`[${ts()}] STREAM_SPAWN worker=${worker.name} model=${model} WARM_HIT pid=${proc.pid}`);
-  } else {
-    const args = buildCliArgs(prompt, model, systemPrompt, true);
-    proc = spawn(worker.bin, args, {
-      env: workerEnv(worker),
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    console.log(`[${ts()}] STREAM_SPAWN worker=${worker.name} model=${model} COLD pid=${proc.pid || "?"}`);
-  }
-  // Write full payload (system prompt + user prompt) to stdin
-  if (proc.stdin) {
-    proc.stdin.write(buildStdinPayload(prompt, systemPrompt));
-    proc.stdin.end();
-  }
-  proc._workerName = worker.name;
-  proc._spawnedAt = Date.now();
-  return proc;
-}
-
-function trackStreamProc(proc, requestId, model, source, worker) {
-  if (proc.pid) {
-    registry.register({
-      pid: proc.pid,
-      requestId,
-      model,
-      mode: "stream",
-      source,
-      worker: `${worker.name}:${worker.bin}`,
-      promptPreview: "[stream]",
-      liveInputTokens: 0,
-      liveOutputTokens: 0,
-    });
-    proc.on("close", () => registry.unregister(proc.pid));
-    proc.on("error", () => registry.unregister(proc.pid));
-  }
-}
-
-// Pick a specific worker by name, or fallback to round-robin
-function getWorkerByName(name) {
-  const enabled = _enabledWorkers();
-  const pool = enabled.length > 0 ? enabled : _workerPool;
-  return pool.find((w) => w.name === name) || null;
-}
-
-function getAlternateWorker(excludeName) {
-  const enabled = _enabledWorkers();
-  const pool = enabled.length > 0 ? enabled : _workerPool;
-  const healthy = pool.filter(
-    (w) => w.name !== excludeName && isWorkerHealthy(w.name)
-  );
-  return healthy.length > 0 ? healthy[0] : null;
-}
+// Worker routing delegated to workerRouter (initialized below)
+function getWorkerByName(name) { return workerRouter?.getWorkerByName(name) || null; }
+function getAlternateWorker(excludeName) { return workerRouter?.getAlternateWorker(excludeName) || null; }
 
 function getAllLimitedStatus() {
   return workerHealth?.getAllLimitedStatus() || null;
@@ -1307,1341 +743,198 @@ function formatLimitNotice(resetAt) {
   return `[Claude limit reached — switching to ${FALLBACK_API.name} fallback until ${t}]`;
 }
 
-// ============================================================
-// Fallback API: stream from an OpenAI-compatible HTTP endpoint
-// Used as last resort when all CLI routers fail
-// ============================================================
-
+// Fallback client — initialized lazily after eventLog/tokenTracker are ready
+let fallbackClient = null;
 function streamFromFallbackApi(messages, model, reqId, source, res) {
-  const fb = FALLBACK_API;
-  const url = new URL(`${fb.baseUrl}/chat/completions`);
-  const isHttps = url.protocol === "https:";
-  const doRequest = isHttps ? httpsRequest : httpRequest;
-
-  const body = JSON.stringify({
-    model: fb.model,
-    messages,
-    stream: true,
-  });
-
-  console.log(`[${ts()}] FALLBACK reqId=${reqId} api=${fb.name} model=${fb.model} src=${source}`);
-  eventLog.push("fallback", { reqId, model, source, fallbackApi: fb.name, fallbackModel: fb.model });
-
-  // Safe write helper — prevent writing to already-closed response
-  const safeWrite = (data) => { if (!res.writableEnded) res.write(data); };
-  const safeEnd = () => { if (!res.writableEnded) res.end(); };
-
-  const apiReq = doRequest(
-    url,
-    {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${fb.apiKey}`,
-        "content-length": Buffer.byteLength(body),
-      },
-    },
-    (apiRes) => {
-      if (apiRes.statusCode !== 200) {
-        let errBody = "";
-        apiRes.on("data", (d) => { errBody += d.toString(); });
-        apiRes.on("end", () => {
-        clearTimeout(fallbackTimer);
-          console.log(`[${ts()}] FALLBACK_ERROR reqId=${reqId} status=${apiRes.statusCode} body=${errBody.slice(0, 200)}`);
-          recordWorkerError("fallback", errBody.includes("Context size") ? "context_overflow" : "api_error", `HTTP ${apiRes.statusCode} ${errBody.slice(0, 100)}`);
-          safeWrite(sseChunk(reqId, `[Fallback ${fb.name} error: HTTP ${apiRes.statusCode}]`));
-          safeWrite(sseChunk(reqId, null, "stop"));
-          safeWrite("data: [DONE]\n\n");
-          safeEnd();
-        });
-        return;
-      }
-
-      // Pipe the SSE stream from the fallback API directly to the client
-      let buf = "";
-      let outputChars = 0;
-      apiRes.on("data", (chunk) => {
-        buf += chunk.toString();
-        const lines = buf.split("\n");
-        buf = lines.pop() || "";
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed === "data: [DONE]") {
-            if (trimmed === "data: [DONE]") {
-              safeWrite("data: [DONE]\n\n");
-            }
-            continue;
-          }
-          if (trimmed.startsWith("data: ")) {
-            try {
-              const ev = JSON.parse(trimmed.slice(6));
-              const delta = ev.choices?.[0]?.delta?.content;
-              const finish = ev.choices?.[0]?.finish_reason;
-              if (delta) {
-                safeWrite(sseChunk(reqId, delta));
-                outputChars += delta.length;
-                sseBroadcast("chunk", { reqId, model: fb.model, source, text: delta, tokens: outputChars, worker: "fallback" });
-              }
-              if (finish) {
-                safeWrite(sseChunk(reqId, null, finish));
-              }
-            } catch { /* skip malformed */ }
-          }
-        }
-      });
-      apiRes.on("end", () => {
-        clearTimeout(fallbackTimer);
-        tokenTracker.record(reqId, fb.model, 0, Math.ceil(outputChars / 4));
-        eventLog.push("complete", { reqId, mode: "fallback", model: fb.model, source, exitCode: 0, outputChars });
-        sseBroadcast("complete", { reqId, model: fb.model, source, exitCode: 0, worker: "fallback" });
-        if (outputChars === 0) {
-          safeWrite(sseChunk(reqId, `[Fallback ${fb.name}: empty response]`));
-        }
-        safeWrite(sseChunk(reqId, null, "stop"));
-        safeWrite("data: [DONE]\n\n");
-        safeEnd();
-      });
-    },
-  );
-
-  const fallbackTimer = setTimeout(() => {
-    console.log(`[${ts()}] FALLBACK_TIMEOUT reqId=${reqId} waited=${FALLBACK_TIMEOUT_MS}ms`);
-    recordWorkerError("fallback", "timeout", `timeout ${FALLBACK_TIMEOUT_MS}ms`);
-    safeWrite(sseChunk(reqId, `[Fallback ${fb.name} timeout after ${FALLBACK_TIMEOUT_MS}ms]`));
-    safeWrite(sseChunk(reqId, null, "stop"));
-    safeWrite("data: [DONE]\n\n");
-    safeEnd();
-    try { apiReq.destroy(new Error("fallback timeout")); } catch { /* ignore */ }
-  }, FALLBACK_TIMEOUT_MS);
-
-  apiReq.on("error", (err) => {
-    clearTimeout(fallbackTimer);
-    console.log(`[${ts()}] FALLBACK_NET_ERROR reqId=${reqId} err=${err.message}`);
-    safeWrite(sseChunk(reqId, `[Fallback ${fb.name} unreachable: ${err.message}]`));
-    safeWrite(sseChunk(reqId, null, "stop"));
-    safeWrite("data: [DONE]\n\n");
-    safeEnd();
-  });
-
-  apiReq.write(body);
-  apiReq.end();
+  if (!fallbackClient) {
+    fallbackClient = createFallbackClient({
+      fallbackApi: FALLBACK_API,
+      timeoutMs: FALLBACK_TIMEOUT_MS,
+      sseChunk,
+      log: (msg) => console.log(`[${ts()}] ${msg}`),
+      recordWorkerError,
+      tokenTracker,
+      eventLog,
+      sseBroadcast,
+    });
+  }
+  return fallbackClient.streamFromFallbackApi(messages, model, reqId, source, res);
 }
-
 function fetchFallbackSync(messages, model, reqId, source) {
-  const fb = FALLBACK_API;
-  const url = new URL(`${fb.baseUrl}/chat/completions`);
-  const isHttps = url.protocol === "https:";
-  const doRequest = isHttps ? httpsRequest : httpRequest;
-
-  const body = JSON.stringify({
-    model: fb.model,
-    messages,
-    stream: false,
-  });
-
-  console.log(`[${ts()}] FALLBACK_SYNC reqId=${reqId} api=${fb.name} model=${fb.model} src=${source}`);
-  eventLog.push("fallback", { reqId, mode: "sync", model, source, fallbackApi: fb.name, fallbackModel: fb.model });
-
-  return new Promise((resolve, reject) => {
-    const apiReq = doRequest(
-      url,
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${fb.apiKey}`,
-          "content-length": Buffer.byteLength(body),
-        },
-      },
-      (apiRes) => {
-        let buf = "";
-        apiRes.on("data", (d) => { buf += d.toString(); });
-        apiRes.on("end", () => {
-          clearTimeout(fallbackTimer);
-          if (apiRes.statusCode !== 200) {
-            console.log(`[${ts()}] FALLBACK_SYNC_ERROR reqId=${reqId} status=${apiRes.statusCode} body=${buf.slice(0, 200)}`);
-            recordWorkerError("fallback", buf.includes("Context size") ? "context_overflow" : "api_error", `HTTP ${apiRes.statusCode} ${buf.slice(0, 100)}`);
-            return reject(new Error(`Fallback HTTP ${apiRes.statusCode}`));
-          }
-          try {
-            const json = JSON.parse(buf);
-            const content = json.choices?.[0]?.message?.content || json.choices?.[0]?.text || "";
-            if (!content) return resolve("");
-            return resolve(content);
-          } catch (err) {
-            return reject(err);
-          }
-        });
-      },
-    );
-
-    
-
-    apiReq.on("error", (err) => {
-      
-      console.log(`[${ts()}] FALLBACK_SYNC_NET_ERROR reqId=${reqId} err=${err.message}`);
-      reject(err);
+  if (!fallbackClient) {
+    fallbackClient = createFallbackClient({
+      fallbackApi: FALLBACK_API,
+      timeoutMs: FALLBACK_TIMEOUT_MS,
+      sseChunk,
+      log: (msg) => console.log(`[${ts()}] ${msg}`),
+      recordWorkerError,
+      tokenTracker,
+      eventLog,
+      sseBroadcast,
     });
-
-    apiReq.write(body);
-    apiReq.end();
-  });
+  }
+  return fallbackClient.fetchFallbackSync(messages, model, reqId, source);
 }
 
-// Response formatting imported from response-formats.mjs
-
-/**
- * Stream response from Anthropic Messages API, converting to OpenAI SSE.
- * Handles text content + tool_use blocks.
- */
+// Anthropic client — initialized lazily after all dependencies are ready
+let anthropicClient = null;
+function getAnthropicClient() {
+  if (!anthropicClient) {
+    anthropicClient = createAnthropicClient({
+      apiBase: ANTHROPIC_API_BASE,
+      apiVersion: ANTHROPIC_API_VERSION,
+      modelIds: ANTHROPIC_MODEL_IDS,
+      maxPromptTokens: MAX_PROMPT_TOKENS,
+      syncTimeoutMs: SYNC_TIMEOUT_MS,
+      cacheConfig: _cacheConfig,
+      tokenRefresher,
+      captureUnifiedRateHeaders,
+      setTokenCooldown,
+      recordWorkerError,
+      recordCacheTtft,
+      getCacheStats,
+      sseChunk,
+      sseToolCallStartChunk,
+      sseToolCallDeltaChunk,
+      sseFinishChunk,
+      convertToolsToAnthropic,
+      convertMessagesToAnthropic,
+      tokenTracker,
+      eventLog,
+      sseBroadcast,
+      log: console.log,
+    });
+  }
+  return anthropicClient;
+}
 function streamFromAnthropicDirect(body, model, reqId, source, res, release, tokenEntry, cacheCtx) {
-  const anthropicModel = ANTHROPIC_MODEL_IDS[model] || ANTHROPIC_MODEL_IDS.sonnet;
-  const anthropicTools = body.tools ? convertToolsToAnthropic(body.tools) : [];
-  const { system, messages } = convertMessagesToAnthropic(body.messages);
-  const trimmed = trimAnthropicMessages(system, messages, MAX_PROMPT_TOKENS);
-  if (trimmed.truncated) {
-    console.log(`[${ts()}] CONTEXT_TRUNCATED reqId=${reqId} beforeChars=${trimmed.beforeChars} afterChars=${trimmed.afterChars}`);
-  }
-
-  const requestBody = {
-    model: anthropicModel,
-    max_tokens: body.max_tokens || 16384,
-    stream: true,
-    messages: trimmed.messages,
-  };
-  if (trimmed.system) {
-    const systemBlocks = buildAnthropicSystemBlocks(trimmed.system, cacheCtx);
-    if (systemBlocks) requestBody.system = systemBlocks;
-  }
-  if (anthropicTools.length > 0) requestBody.tools = anthropicTools;
-  if (body.tool_choice) {
-    if (body.tool_choice === "auto") requestBody.tool_choice = { type: "auto" };
-    else if (body.tool_choice === "none") requestBody.tool_choice = { type: "none" };
-    else if (body.tool_choice === "required") requestBody.tool_choice = { type: "any" };
-    else if (body.tool_choice?.type === "function") {
-      requestBody.tool_choice = { type: "tool", name: body.tool_choice.function.name };
-    }
-  }
-
-  const bodyStr = JSON.stringify(requestBody);
-  if (cacheCtx) {
-    console.log(
-      `[${ts()}] CACHE_APPLY reqId=${reqId} model=${model} applied=${cacheCtx.appliedCount} ` +
-      `prefixChars=${cacheCtx.systemPrefix?.length || 0} toolsHash=${cacheCtx.toolsHash} ` +
-      `cache_key_hash=${cacheCtx.cacheKeyHash} reason=${cacheCtx.reason}`
-    );
-  }
-  const authHeaderName = tokenEntry.type === "oauth_flat" ? "authorization" : "x-api-key";
-  const liveToken = tokenRefresher.getActiveToken(tokenEntry.name) || tokenEntry.token;
-  const authHeaderValue = tokenEntry.type === "oauth_flat" ? `Bearer ${liveToken}` : liveToken;
-  console.log(
-    `[${ts()}] ANTHROPIC_STREAM reqId=${reqId} model=${anthropicModel} ` +
-    `tools=${anthropicTools.length} msgs=${messages.length} auth=${tokenEntry.type} token=${tokenEntry.name} src=${source}`
-  );
-  eventLog.push("anthropic_direct", {
-    reqId, model: anthropicModel, tools: anthropicTools.length, source, auth: tokenEntry.type, token: tokenEntry.name,
-  });
-
-  const requestStart = Date.now();
-  let firstTokenAt = null;
-  const cacheApplied = cacheCtx?.appliedCount > 0;
-
-  const safeWrite = (data) => { if (!res.writableEnded) res.write(data); };
-  const safeEnd = () => { if (!res.writableEnded) res.end(); };
-  let released = false;
-  const doRelease = () => { if (!released) { released = true; release(); } };
-
-  const url = new URL(`${ANTHROPIC_API_BASE}/v1/messages`);
-  const headers = {
-    "content-type": "application/json",
-    "anthropic-version": ANTHROPIC_API_VERSION,
-    ...(tokenEntry.type === "oauth_flat" ? { "anthropic-beta": "oauth-2025-04-20" } : {}),
-    "content-length": String(Buffer.byteLength(bodyStr)),
-  };
-  headers[authHeaderName] = authHeaderValue;
-
-  const apiReq = httpsRequest(url, { method: "POST", headers }, (apiRes) => {
-    captureUnifiedRateHeaders(apiRes, tokenEntry);
-    if (apiRes.statusCode !== 200) {
-      let errBody = "";
-      apiRes.on("data", (d) => { errBody += d.toString(); });
-      apiRes.on("end", () => {
-
-        if (apiRes.statusCode === 429) {
-          const retryHeader = apiRes.headers["retry-after"];
-          let retryMs = 30000;
-          if (retryHeader) {
-            const sec = Number(retryHeader);
-            if (!Number.isNaN(sec)) retryMs = Math.max(retryMs, sec * 1000);
-          }
-          setTokenCooldown(tokenEntry, retryMs, "anthropic_429");
-        }
-
-        // 401: OAuth token expired — trigger auto-refresh for next requests
-        if (apiRes.statusCode === 401) {
-          recordWorkerError(tokenEntry.name, "auth_expired", `401: ${errBody.slice(0, 100)}`);
-          tokenRefresher.handleAuthError(tokenEntry).then(result => {
-            if (result.refreshed) {
-              console.log(`[${ts()}] TOKEN_REFRESHED token=${tokenEntry.name} — next requests use new token`);
-            }
-          }).catch(err => {
-            console.error(`[${ts()}] TOKEN_REFRESH_FAIL token=${tokenEntry.name} err=${err.message}`);
-          });
-        }
-
-        console.log(`[${ts()}] ANTHROPIC_ERROR reqId=${reqId} status=${apiRes.statusCode} body=${errBody.slice(0, 500)}`);
-        eventLog.push("error", { reqId, mode: "anthropic_direct", model, source, status: apiRes.statusCode });
-        safeWrite(sseChunk(reqId, `[Anthropic API error: HTTP ${apiRes.statusCode}]`));
-        safeWrite(sseFinishChunk(reqId, "stop"));
-        safeWrite("data: [DONE]\n\n");
-        safeEnd();
-        doRelease();
-      });
-      return;
-    }
-
-    let buf = "";
-    let toolCallIndex = -1;
-    const toolCalls = [];
-    let inputTokens = 0;
-    let outputTokens = 0;
-    let outputChars = 0;
-
-    apiRes.on("data", (chunk) => {
-      buf += chunk.toString();
-      const lines = buf.split("\n");
-      buf = lines.pop() || "";
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("data: ")) continue;
-
-        let ev;
-        try { ev = JSON.parse(trimmed.slice(6)); } catch { continue; }
-
-        if (ev.type === "message_start") {
-          inputTokens = ev.message?.usage?.input_tokens || 0;
-        } else if (ev.type === "content_block_start") {
-          const block = ev.content_block;
-          if (block?.type === "tool_use") {
-            toolCallIndex++;
-            toolCalls.push({ index: toolCallIndex, id: block.id, name: block.name, arguments: "" });
-            safeWrite(sseToolCallStartChunk(reqId, toolCallIndex, block.id, block.name));
-          }
-          // text blocks and thinking blocks: no special start action needed
-        } else if (ev.type === "content_block_delta") {
-          if (ev.delta?.type === "text_delta" && ev.delta.text) {
-            if (!firstTokenAt) {
-              firstTokenAt = Date.now();
-              const ttftMs = firstTokenAt - requestStart;
-              recordCacheTtft(ttftMs, cacheApplied);
-              console.log(
-                `[${ts()}] CACHE_TTFT reqId=${reqId} model=${model} cached=${cacheApplied} ` +
-                `ttftMs=${ttftMs} cachedAvg=${cacheStats.ttftCachedAvg ?? "n/a"} uncachedAvg=${cacheStats.ttftUncachedAvg ?? "n/a"}`
-              );
-            }
-            safeWrite(sseChunk(reqId, ev.delta.text));
-            outputChars += ev.delta.text.length;
-            sseBroadcast("chunk", { reqId, model, source, text: ev.delta.text, tokens: outputChars, worker: tokenEntry.name });
-          } else if (ev.delta?.type === "input_json_delta" && ev.delta.partial_json !== undefined) {
-            const tc = toolCalls[toolCalls.length - 1];
-            if (tc) {
-              tc.arguments += ev.delta.partial_json;
-              safeWrite(sseToolCallDeltaChunk(reqId, tc.index, ev.delta.partial_json));
-            }
-          }
-          // thinking_delta: skip silently
-        } else if (ev.type === "message_delta") {
-          outputTokens = ev.usage?.output_tokens || outputTokens;
-          const stop = ev.delta?.stop_reason;
-          if (stop) {
-            const finish = stop === "tool_use" ? "tool_calls"
-              : stop === "end_turn" ? "stop"
-              : stop === "max_tokens" ? "length"
-              : "stop";
-            safeWrite(sseFinishChunk(reqId, finish));
-          }
-        }
-        // message_stop, content_block_stop, ping: no action needed
-      }
-    });
-
-    apiRes.on("end", () => {
-      tokenTracker.record(reqId, model, inputTokens, outputTokens);
-      eventLog.push("complete", {
-        reqId, mode: "anthropic_direct", model, source,
-        inputTokens, outputTokens, toolCalls: toolCalls.length,
-      });
-      sseBroadcast("complete", { reqId, model, source, inputTokens, outputTokens, worker: tokenEntry.name });
-      safeWrite("data: [DONE]\n\n");
-      safeEnd();
-      doRelease();
-    });
-
-    apiRes.on("error", (err) => {
-      console.log(`[${ts()}] ANTHROPIC_STREAM_ERR reqId=${reqId} err=${err.message}`);
-      safeWrite(sseChunk(reqId, `[Anthropic stream error: ${err.message}]`));
-      safeWrite("data: [DONE]\n\n");
-      safeEnd();
-      doRelease();
-    });
-  });
-
-  // Client disconnect: abort Anthropic API request
-  res.on("close", () => {
-    if (!apiReq.destroyed) {
-      console.log(`[${ts()}] CLIENT_DISCONNECT reqId=${reqId} — aborting Anthropic API request`);
-      apiReq.destroy();
-    }
-    doRelease();
-  });
-
-  
-
-  apiReq.on("error", (err) => {
-    
-    console.log(`[${ts()}] ANTHROPIC_NET_ERR reqId=${reqId} err=${err.message}`);
-    eventLog.push("error", { reqId, mode: "anthropic_direct", model, source, error: err.message });
-    safeWrite(sseChunk(reqId, `[Anthropic API unreachable: ${err.message}]`));
-    safeWrite(sseFinishChunk(reqId, "stop"));
-    safeWrite("data: [DONE]\n\n");
-    safeEnd();
-    doRelease();
-  });
-
-  apiReq.write(bodyStr);
-  apiReq.end();
+  return getAnthropicClient().streamFromAnthropicDirect(body, model, reqId, source, res, release, tokenEntry, cacheCtx);
 }
-
-/**
- * Call Anthropic Messages API synchronously (non-streaming).
- * Returns { content, toolCalls, usage, stopReason }.
- */
 function callAnthropicDirect(body, model, reqId, source, tokenEntry, cacheCtx) {
-  return new Promise((resolve, reject) => {
-    const anthropicModel = ANTHROPIC_MODEL_IDS[model] || ANTHROPIC_MODEL_IDS.sonnet;
-    const anthropicTools = body.tools ? convertToolsToAnthropic(body.tools) : [];
-    const { system, messages } = convertMessagesToAnthropic(body.messages);
-    const trimmed = trimAnthropicMessages(system, messages, MAX_PROMPT_TOKENS);
-    if (trimmed.truncated) {
-      console.log(`[${ts()}] CONTEXT_TRUNCATED reqId=${reqId} beforeChars=${trimmed.beforeChars} afterChars=${trimmed.afterChars}`);
-    }
-
-    const requestBody = {
-      model: anthropicModel,
-      max_tokens: body.max_tokens || 16384,
-      messages: trimmed.messages,
-    };
-    if (trimmed.system) {
-      const systemBlocks = buildAnthropicSystemBlocks(trimmed.system, cacheCtx);
-      if (systemBlocks) requestBody.system = systemBlocks;
-    }
-    if (anthropicTools.length > 0) requestBody.tools = anthropicTools;
-
-    const bodyStr = JSON.stringify(requestBody);
-    const authHeaderName = tokenEntry.type === "oauth_flat" ? "authorization" : "x-api-key";
-    const liveTokenSync = tokenRefresher.getActiveToken(tokenEntry.name) || tokenEntry.token;
-    const authHeaderValue = tokenEntry.type === "oauth_flat" ? `Bearer ${liveTokenSync}` : liveTokenSync;
-    console.log(
-      `[${ts()}] ANTHROPIC_SYNC reqId=${reqId} model=${anthropicModel} ` +
-      `tools=${anthropicTools.length} auth=${tokenEntry.type} token=${tokenEntry.name} src=${source}`
-    );
-
-    const url = new URL(`${ANTHROPIC_API_BASE}/v1/messages`);
-    const headers = {
-      "content-type": "application/json",
-      "anthropic-version": ANTHROPIC_API_VERSION,
-      ...(tokenEntry.type === "oauth_flat" ? { "anthropic-beta": "oauth-2025-04-20" } : {}),
-      "content-length": String(Buffer.byteLength(bodyStr)),
-    };
-    headers[authHeaderName] = authHeaderValue;
-
-    const timer = setTimeout(() => {
-      apiReq.destroy();
-      reject(new Error(`Anthropic API timeout after ${SYNC_TIMEOUT_MS}ms`));
-    }, SYNC_TIMEOUT_MS);
-
-    const apiReq = httpsRequest(url, { method: "POST", headers }, (apiRes) => {
-      captureUnifiedRateHeaders(apiRes, tokenEntry);
-      let resBody = "";
-      apiRes.on("data", (d) => { resBody += d.toString(); });
-      apiRes.on("end", () => {
-
-        clearTimeout(timer);
-        if (apiRes.statusCode !== 200) {
-          if (apiRes.statusCode === 429) {
-            const retryHeader = apiRes.headers["retry-after"];
-            let retryMs = 30000;
-            if (retryHeader) {
-              const sec = Number(retryHeader);
-              if (!Number.isNaN(sec)) retryMs = Math.max(retryMs, sec * 1000);
-            }
-            setTokenCooldown(tokenEntry, retryMs, "anthropic_429");
-          }
-          // 401: trigger refresh and mark error for retry
-          if (apiRes.statusCode === 401) {
-            recordWorkerError(tokenEntry.name, "auth_expired", `401: ${resBody.slice(0, 100)}`);
-            tokenRefresher.handleAuthError(tokenEntry).then(refreshResult => {
-              const err = new Error(`Anthropic API HTTP 401: auth error`);
-              err.statusCode = 401;
-              err.refreshed = refreshResult.refreshed;
-              reject(err);
-            }).catch(() => {
-              const err = new Error(`Anthropic API HTTP 401: auth error (refresh failed)`);
-              err.statusCode = 401;
-              err.refreshed = false;
-              reject(err);
-            });
-            return;
-          }
-          return reject(new Error(`Anthropic API HTTP ${apiRes.statusCode}: ${resBody.slice(0, 500)}`));
-        }
-        try {
-          const result = JSON.parse(resBody);
-          let textContent = "";
-          const toolCalls = [];
-          for (const block of (result.content || [])) {
-            if (block.type === "text") textContent += block.text;
-            else if (block.type === "tool_use") {
-              toolCalls.push({ id: block.id, name: block.name, arguments: JSON.stringify(block.input) });
-            }
-          }
-          const rawUsage = result.usage || {};
-          const inputTokens = rawUsage.input_tokens || 0;
-          const outputTokens = rawUsage.output_tokens || 0;
-          const cacheCreation = rawUsage.cache_creation_input_tokens || 0;
-          const cacheRead = rawUsage.cache_read_input_tokens || 0;
-          resolve({
-            content: textContent || null,
-            toolCalls,
-            usage: buildUsage({ inputTokens, outputTokens, cacheCreation, cacheRead }),
-            stopReason: result.stop_reason,
-          });
-        } catch (err) {
-          reject(new Error(`Failed to parse Anthropic response: ${err.message}`));
-        }
-      });
-    });
-
-    
-
-  apiReq.on("error", (err) => {
-    
-      clearTimeout(timer);
-      reject(err);
-    });
-
-    apiReq.write(bodyStr);
-    apiReq.end();
-  });
+  return getAnthropicClient().callAnthropicDirect(body, model, reqId, source, tokenEntry, cacheCtx);
 }
-
-/**
- * Handle ALL requests via direct Anthropic API with token round-robin.
- * Supports both tool-enabled and text-only requests.
- */
-async function handleApiDirect(body, model, stream, source, req, res) {
-  const priority = MODEL_PRIORITY[model] || "normal";
-  const estTokens = Math.min(Math.ceil(JSON.stringify(body.messages).length / 4), 5000);
-  const reqId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 24)}`;
-  const cacheCtx = buildCacheContext({ body, model, source, req, applyCacheControl: true });
-  recordCacheCandidate(cacheCtx.candidateCount);
-  recordCacheApplied(cacheCtx.appliedCount);
-  const cacheSeen = recordCacheKey(cacheCtx.cacheKeyHash);
-  sessionStatsStore?.record(getSessionIdForStats(req), cacheSeen.seen).catch?.(() => {});
-  console.log(
-    `[${ts()}] CACHE_CTX reqId=${reqId} src=${source} tenant=${cacheCtx.tenant} model=${model} ` +
-    `candidate=${cacheCtx.candidateCount} applied=${cacheCtx.appliedCount} ` +
-    `hit=${cacheSeen.seen ? "hit" : "miss"} hitRate=${getCacheStats().hitRate} ` +
-    `cache_key_hash=${cacheCtx.cacheKeyHash} reason=${cacheCtx.reason}`
-  );
-
-  let release;
-  try {
-    release = await queue.acquire(source, priority);
-  } catch (err) {
-    return sendError(res, 503, {
-      message: `Queue full: ${err.message}`,
-      type: "queue_full",
-      retry_after_ms: 10000,
-    }, { "retry-after": "10" });
-  }
-
-  let rateWaitTotal = 0;
-  while (true) {
-    const rateCheck = rateLimiter.check(model, estTokens);
-    if (rateCheck.ok) break;
-    if (rateWaitTotal >= 300000) {
-      release();
-      return sendError(res, 503, { message: "Rate limit wait exceeded", type: "rate_limit_timeout" });
-    }
-    const sleepMs = Math.min(rateCheck.waitMs, 5000);
-    await new Promise(r => setTimeout(r, sleepMs));
-    rateWaitTotal += sleepMs;
-  }
-
-  rateLimiter.record(model, estTokens);
-
-  const requestedTokenRaw = req.headers["x-token-name"] ?? body.tokenName;
-  let tokenEntry = null;
-  if (ALLOW_EXPLICIT_TOKEN_OVERRIDE && requestedTokenRaw !== undefined && requestedTokenRaw !== null) {
-    const requestedTokenName = String(requestedTokenRaw).trim();
-    if (requestedTokenName) {
-      tokenEntry = TOKEN_POOL.find(t => t.name === requestedTokenName) || null;
-    }
-  }
-  if (!tokenEntry) tokenEntry = getNextToken();
-  await waitForTokenCooldown(tokenEntry);
-  recordWorkerRequest(tokenEntry.name);
-  eventLog.push("request", {
-    reqId, mode: stream ? "stream_tools" : "sync_tools", model, source, priority,
-    toolCount: body.tools?.length || 0, worker: tokenEntry.name,
-  });
-  sseBroadcast("request", {
-    reqId, mode: stream ? "stream_tools" : "sync_tools", model, source, priority, worker: tokenEntry.name,
-  });
-  console.log(
-    `[${ts()}] ${stream ? "STREAM" : "SYNC"}_API src=${source} model=${model} ` +
-    `tools=${body.tools?.length || 0} token=${tokenEntry.name} reqId=${reqId}`
-  );
-
-  if (stream) {
-    res.writeHead(200, {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-      "x-accel-buffering": "no",
-    });
-    res.flushHeaders();
-    if (res.socket) res.socket.setNoDelay(true);
-
-    streamFromAnthropicDirect(body, model, reqId, source, res, release, tokenEntry, cacheCtx);
-  } else {
-    try {
-      const result = await callAnthropicDirect(body, model, reqId, source, tokenEntry, cacheCtx);
-      release();
-      tokenTracker.record(reqId, model, result.usage.prompt_tokens, result.usage.completion_tokens);
-      eventLog.push("complete", {
-        reqId, mode: "anthropic_direct_sync", model, source, ...result.usage,
-      });
-      sseBroadcast("complete", {
-        reqId, model, source, worker: tokenEntry.name,
-        inputTokens: result.usage.prompt_tokens,
-        outputTokens: result.usage.completion_tokens,
-      });
-      sendJson(res, 200, completionResponseWithTools(
-        reqId, result.content, result.toolCalls, model, result.usage,
-      ));
-    } catch (err) {
-      // 401 with successful refresh — retry once with new token
-      if (err.statusCode === 401 && err.refreshed) {
-        console.log(`[${ts()}] RETRY_AFTER_REFRESH reqId=${reqId} token=${tokenEntry.name}`);
-        try {
-          const retryResult = await callAnthropicDirect(body, model, reqId + "-retry", source, tokenEntry, cacheCtx);
-          release();
-          tokenTracker.record(reqId, model, retryResult.usage.prompt_tokens, retryResult.usage.completion_tokens);
-          eventLog.push("complete", {
-            reqId, mode: "anthropic_direct_sync_retry", model, source, ...retryResult.usage,
-          });
-          sseBroadcast("complete", {
-            reqId, model, source, worker: tokenEntry.name,
-            inputTokens: retryResult.usage.prompt_tokens,
-            outputTokens: retryResult.usage.completion_tokens,
-          });
-          sendJson(res, 200, completionResponseWithTools(
-            reqId, retryResult.content, retryResult.toolCalls, model, retryResult.usage,
-          ));
-          return;
-        } catch (retryErr) {
-          console.error(`[${ts()}] RETRY_FAILED reqId=${reqId} ${retryErr.message}`);
-          // Fall through to normal error handling
-        }
-      }
-      release();
-      console.error(`[${ts()}] TOOL_REQ_ERROR reqId=${reqId} src=${source} ${err.message}`);
-      eventLog.push("error", { reqId, mode: "anthropic_direct", model, source, error: err.message });
-      sseBroadcast("error", { reqId, model, source, worker: tokenEntry.name, error: err.message });
-      sendError(res, 500, { message: err.message, type: "anthropic_api_error" });
-    }
-  }
+function streamAnthropicNative(body, reqId, source, res, release, tokenEntry, cacheCtx) {
+  return getAnthropicClient().streamAnthropicNative(body, reqId, source, res, release, tokenEntry, cacheCtx);
+}
+function callAnthropicNative(body, reqId, source, tokenEntry, cacheCtx) {
+  return getAnthropicClient().callAnthropicNative(body, reqId, source, tokenEntry, cacheCtx);
 }
 
 // ============================================================
-// Request handler: /v1/chat/completions
+// Extracted modules — initialized after all dependencies are available
 // ============================================================
 
-async function handleCompletions(req, res) {
-  const source = identifySource(req);
+const cliRunner = createCliRunner({
+  getNextWorker,
+  workerAcquire,
+  workerRelease,
+  getAlternateWorker: (name) => workerRouter?.getAlternateWorker(name) || null,
+  sessionAffinity,
+  recordWorkerRequest,
+  recordWorkerError,
+  isRateLimitError,
+  markWorkerLimited,
+  warmPool,
+  registry,
+  eventLog,
+  retryPolicy,
+  autoHeal,
+  classifyCliError,
+  workerEnv,
+  syncTimeoutMs: SYNC_TIMEOUT_MS,
+  maxRetries: MAX_RETRIES,
+  config: CONFIG,
+});
 
-  let rawBody;
-  try {
-    rawBody = await readBody(req, MAX_BODY_BYTES);
-  } catch (err) {
-    return sendError(res, 413, { message: err.message || "Payload too large", type: "payload_too_large" });
-  }
+const adminRoutes = createAdminRoutes({
+  config: CONFIG,
+  queue,
+  registry,
+  workerHealth,
+  autoHeal,
+  sessionAffinity,
+  systemReaper,
+  warmPool,
+  eventLog,
+  tokenTracker,
+  metricsStore,
+  metricsController,
+  workerStats,
+  workerState,
+  tokenRefresher,
+  tokenPool: TOKEN_POOL,
+  modelMap: MODEL_MAP,
+  redis,
+  getCacheStats,
+  sendJson,
+  sendError,
+  readBody,
+  staticDir: __dirname,
+  port: PORT,
+  maxBodyBytes: MAX_BODY_BYTES,
+  getSseClients: () => sseClients,
+  setSseClients: (s) => { sseClients = s; },
+});
 
-  let body;
-  try {
-    body = JSON.parse(rawBody);
-  } catch {
-    return sendError(res, 400, { message: "Invalid JSON body", type: "invalid_request" });
-  }
-
-  const { messages, model: rawModel = "claude-code", stream = false } = body;
-  if (!messages || !Array.isArray(messages)) {
-    return sendError(res, 400, { message: "messages array required", type: "invalid_request" });
-  }
-
-  // API direct path: only when CLI agent mode is off and tokens are available
-  if (!USE_CLI_AGENTS && TOKEN_POOL.length > 0) {
-    return handleApiDirect(body, resolveModel(rawModel), stream, source, req, res);
-  }
-
-  const { prompt, systemPrompt } = extractPrompt(messages);
-  if (!prompt) {
-    return sendError(res, 400, { message: "No user message found", type: "invalid_request" });
-  }
-
-  // Session affinity: derive a key so the same conversation sticks to the same worker
-  const sessionKey = sessionAffinity.deriveKey({
-    source,
-    sessionId: req.headers["x-session-id"] || "",
-    systemPrompt: systemPrompt || "",
-  });
-
-  const model = resolveModel(rawModel);
-  const cacheCtx = buildCacheContext({ body, model, source, req, applyCacheControl: false });
-  recordCacheCandidate(cacheCtx.candidateCount);
-  recordCacheApplied(cacheCtx.appliedCount);
-  const cacheSeen = recordCacheKey(cacheCtx.cacheKeyHash);
-  sessionStatsStore?.record(getSessionIdForStats(req), cacheSeen.seen).catch?.(() => {});
-
-  const priority = MODEL_PRIORITY[model] || "normal";
-  // Estimated tokens for rate-limiter: use a small fixed cap.
-  // chars/4 wildly over-estimates (code/JSON has low token density).
-  // The real rate limit is Anthropic's 429 response; our limiter is
-  // just a courtesy throttle.  Cap at 5000 so ~11 opus requests/min
-  // can coexist (57000/5000).  If Anthropic 429s, the retry loop handles it.
-  const estTokens = Math.min(Math.ceil(prompt.length / 4), 5000);
-  const reqId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 24)}`;
-
-  console.log(
-    `[${ts()}] CACHE_CTX reqId=${reqId} src=${source} tenant=${cacheCtx.tenant} model=${model} ` +
-    `candidate=${cacheCtx.candidateCount} applied=${cacheCtx.appliedCount} ` +
-    `hit=${cacheSeen.seen ? "hit" : "miss"} hitRate=${getCacheStats().hitRate} ` +
-    `cache_key_hash=${cacheCtx.cacheKeyHash} reason=${cacheCtx.reason}`
-  );
-
-  // Acquire slot via fair queue (waits for turn, never rejects)
-  let release;
-  try {
-    release = await queue.acquire(source, priority);
-  } catch (err) {
-    // Only rejects if queue is truly full (100+ pending)
-    console.log(`[${ts()}] QUEUE_FULL src=${source} model=${model} ${err.message}`);
-    return sendError(res, 503, {
-      message: `Queue full, try again shortly: ${err.message}`,
-      type: "queue_full",
-      retry_after_ms: 10000,
-    }, { "retry-after": "10" });
-  }
-
-  // Wait for rate limit window (sleep instead of rejecting)
-  let rateWaitTotal = 0;
-  const MAX_RATE_WAIT_MS = 300000;
-  while (true) {
-    const rateCheck = rateLimiter.check(model, estTokens);
-    if (rateCheck.ok) break;
-    if (rateWaitTotal >= MAX_RATE_WAIT_MS) {
-      release();
-      console.log(`[${ts()}] RATE_TIMEOUT src=${source} model=${model} waited ${rateWaitTotal}ms`);
-      return sendError(res, 503, {
-        message: `Rate limit wait exceeded ${MAX_RATE_WAIT_MS}ms`,
-        type: "rate_limit_timeout",
-      });
-    }
-    const sleepMs = Math.min(rateCheck.waitMs, 5000);
-    console.log(`[${ts()}] RATE_WAIT src=${source} model=${model} sleeping ${sleepMs}ms (${rateCheck.reason})`);
-    await new Promise((r) => setTimeout(r, sleepMs));
-    rateWaitTotal += sleepMs;
-  }
-
-  rateLimiter.record(model, estTokens);
-  eventLog.push("request", { reqId, mode: stream ? "stream" : "sync", model, source, priority });
-  sseBroadcast("request", { reqId, mode: stream ? "stream" : "sync", model, source, priority, promptPreview: prompt.slice(0, 80) });
-  console.log(`[${ts()}] ${stream ? "STREAM" : "SYNC"} src=${source} model=${model} prio=${priority} session=${sessionKey.slice(0, 30)} prompt=${prompt.slice(0, 60)}...`);
-
-  if (stream) {
-    res.writeHead(200, {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-      "x-accel-buffering": "no",       // hint to reverse proxies: don't buffer
-    });
-    res.flushHeaders();                 // force headers out immediately
-    if (res.socket) {
-      res.socket.setNoDelay(true);      // disable Nagle — send chunks immediately
-    }
-    // Immediate keepalive: prevents Gateway from timing out while CLI spawns.
-    // Without this, there's a 4-10s gap between headers and first CLI output,
-    // causing ~49% of requests to be disconnected by Gateway.
-    res.write(":proxy-accepted\n\n");
-
-    const allLimited = getAllLimitedStatus();
-    if (allLimited) {
-      const notice = formatLimitNotice(allLimited.nextReset);
-      res.write(sseChunk(reqId, notice));
-      streamFromFallbackApi(messages, model, reqId, source, res);
-      return;
-    }
-
-    // Stream with auto-retry: if a worker fails quickly (<5s, no content),
-    // automatically retry on a different worker before giving up.
-    // If ALL CLI routers fail, fall back to the API endpoint (e.g. MiniMax).
-    const QUICK_FAIL_MS = 5000;
-    const retryPoolBase = _enabledWorkers();
-    const retryPool = retryPoolBase.length > 0 ? retryPoolBase : _workerPool;
-    const MAX_RETRIES = retryPool.length;  // try each router once
-    const inputEstimate = Math.ceil(prompt.length / 4);
-    const originalMessages = messages;  // preserve for fallback API
-    let retryCount = 0;
-    const triedRouters = new Set();
-    let activeProc = null;  // track current CLI process for client-disconnect cleanup
-
-    // If client disconnects, kill the CLI process to free resources
-    res.on("close", () => {
-      if (activeProc && !activeProc.killed) {
-        console.log(`[${ts()}] CLIENT_DISCONNECT reqId=${reqId} — killing CLI pid=${activeProc.pid}`);
-        try { activeProc.kill("SIGTERM"); } catch { /* ignore */ }
-      }
-    });
-
-    function pipeStream(workerOverride, isRetry) {
-      const worker = workerOverride || getNextWorker(sessionKey);
-      // Bind this session to the chosen worker
-      sessionAffinity.assign(sessionKey, worker.name);
-      triedRouters.add(worker.name);
-      console.log(`[${ts()}] CLIROUTER obj=${worker.name} bin=${worker.bin} reqId=${reqId} model=${model} src=${source}${isRetry ? ` RETRY#${retryCount}` : ""}`);
-      recordWorkerRequest(worker.name);
-      workerAcquire(worker.name);
-      const proc = spawnCliStream(prompt, model, systemPrompt, worker);
-      activeProc = proc;  // update for client-disconnect handler
-      trackStreamProc(proc, reqId, model, source, worker);
-
-      let buffer = "";
-      let stderrBuf = "";
-      let sentContent = false;
-      let reqTokens = { input: 0, output: 0 };
-      let outputChars = 0;
-      const spawnedAt = Date.now();
-
-      proc.stderr.on("data", (d) => { stderrBuf += d.toString(); });
-
-      // First-byte warning: if CLI hasn't produced stdout within 8s, log a warning.
-      // This helps diagnose macOS auth dialogs, slow spawns, or keychain prompts.
-      const FIRST_BYTE_WARN_MS = 8_000;
-      const firstByteTimer = setTimeout(() => {
-        console.log(`[${ts()}] SLOW_SPAWN pid=${proc.pid} reqId=${reqId} model=${model} router=${worker.name} elapsed=${FIRST_BYTE_WARN_MS}ms — no stdout yet (possible macOS dialog or slow startup)`);
-        eventLog.push("timeout", { kind: "slow_spawn", pid: proc.pid, reqId, model, source, elapsed: FIRST_BYTE_WARN_MS });
-      }, FIRST_BYTE_WARN_MS);
-
-      const heartbeatMs = HEARTBEAT_BY_MODEL[model] || DEFAULT_HEARTBEAT_MS;
-      let heartbeatTimer = setTimeout(() => {
-        eventLog.push("timeout", { kind: "heartbeat", pid: proc.pid, reqId, model, source, heartbeatMs });
-        console.log(`[${ts()}] HEARTBEAT_TIMEOUT pid=${proc.pid} reqId=${reqId} model=${model} src=${source} limit=${heartbeatMs}ms`);
-        try { proc.kill("SIGTERM"); } catch { /* ignore */ }
-      }, heartbeatMs);
-
-      function resetHeartbeat() {
-        clearTimeout(heartbeatTimer);
-        heartbeatTimer = setTimeout(() => {
-          eventLog.push("timeout", { kind: "heartbeat", pid: proc.pid, reqId, model, source, heartbeatMs });
-          console.log(`[${ts()}] HEARTBEAT_TIMEOUT pid=${proc.pid} reqId=${reqId} model=${model} src=${source} limit=${heartbeatMs}ms`);
-          try { proc.kill("SIGTERM"); } catch { /* ignore */ }
-        }, heartbeatMs);
-      }
-
-      const execTimer = setTimeout(() => {
-        eventLog.push("timeout", { kind: "stream_exec", pid: proc.pid, reqId, model });
-        console.log(`[${ts()}] STREAM_TIMEOUT pid=${proc.pid} reqId=${reqId} model=${model} age=${STREAM_TIMEOUT_MS}ms`);
-        try { proc.kill("SIGTERM"); } catch { /* ignore */ }
-      }, STREAM_TIMEOUT_MS);
-
-      // SSE keepalive: send comment lines to prevent upstream (Gateway) HTTP timeout.
-      // SSE spec allows `:comment\n\n` — client parsers ignore it but the TCP stays alive.
-      // Phase 1: fast keepalive (5s) during CLI startup; Phase 2: slow (30s) after first content.
-      const FAST_KEEPALIVE_MS = 5_000;
-      const SLOW_KEEPALIVE_MS = 30_000;
-      let keepaliveMs = FAST_KEEPALIVE_MS;
-      let keepaliveInterval = setInterval(() => {
-        if (!res.writableEnded) {
-          try { res.write(":keepalive\n\n"); } catch { /* ignore write errors */ }
-        }
-      }, keepaliveMs);
-      function slowDownKeepalive() {
-        if (keepaliveMs === FAST_KEEPALIVE_MS) {
-          keepaliveMs = SLOW_KEEPALIVE_MS;
-          clearInterval(keepaliveInterval);
-          keepaliveInterval = setInterval(() => {
-            if (!res.writableEnded) {
-              try { res.write(":keepalive\n\n"); } catch { /* ignore */ }
-            }
-          }, SLOW_KEEPALIVE_MS);
-        }
-      }
-
-      proc.stdout.on("data", (data) => {
-        clearTimeout(firstByteTimer); // CLI is alive — cancel slow-spawn warning
-        resetHeartbeat();
-        slowDownKeepalive(); // CLI is producing output, switch to slow keepalive
-        buffer += data.toString();
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const ev = JSON.parse(line);
-            const canWrite = !res.writableEnded;
-            // stream_event: incremental deltas from --include-partial-messages
-            if (ev.type === "stream_event" && ev.event?.type === "content_block_delta") {
-              const text = ev.event.delta?.text;
-              if (text) {
-                if (canWrite) res.write(sseChunk(reqId, text));
-                outputChars += text.length;
-                sentContent = true;
-                sseBroadcast("chunk", { reqId, model, source, text, tokens: outputChars, worker: worker.name });
-              }
-            } else if (ev.type === "stream_event" && ev.event?.type === "message_delta") {
-              const usage = ev.event.usage;
-              if (usage) {
-                // Total input = non-cached + cache-created + cache-read
-                const totalInput = (usage.input_tokens || 0)
-                  + (usage.cache_creation_input_tokens || 0)
-                  + (usage.cache_read_input_tokens || 0);
-                reqTokens = { input: totalInput, output: usage.output_tokens || 0 };
-              }
-            } else if (ev.type === "assistant" && ev.message?.content) {
-              if (!sentContent) {
-                for (const b of ev.message.content) {
-                  if (b.type === "text" && b.text) {
-                    if (canWrite) res.write(sseChunk(reqId, b.text));
-                    outputChars += b.text.length;
-                    sentContent = true;
-                    sseBroadcast("chunk", { reqId, model, source, text: b.text, tokens: outputChars, worker: worker.name });
-                  }
-                }
-              }
-            } else if (ev.type === "content_block_delta" && ev.delta?.text) {
-              if (canWrite) res.write(sseChunk(reqId, ev.delta.text));
-              outputChars += ev.delta.text.length;
-              sentContent = true;
-              sseBroadcast("chunk", { reqId, model, source, text: ev.delta.text, tokens: outputChars, worker: worker.name });
-            } else if (ev.type === "result" && ev.result && !sentContent) {
-              if (canWrite) res.write(sseChunk(reqId, ev.result));
-              sentContent = true;
-            }
-            // Capture token usage (include cached tokens in total input)
-            const usage = ev.usage || ev.message?.usage;
-            if (usage) {
-              const totalInput = (usage.input_tokens || usage.prompt_tokens || 0)
-                + (usage.cache_creation_input_tokens || 0)
-                + (usage.cache_read_input_tokens || 0);
-              reqTokens = {
-                input: totalInput,
-                output: usage.output_tokens || usage.completion_tokens || 0,
-              };
-            }
-          } catch { /* non-JSON line, skip */ }
-        }
-        if (proc.pid) {
-          const liveInput = reqTokens.input > 0 ? reqTokens.input : inputEstimate;
-          const liveOutput = reqTokens.output > 0 ? reqTokens.output : Math.ceil(outputChars / 4);
-          registry.touch(proc.pid, { liveInputTokens: liveInput, liveOutputTokens: liveOutput });
-        }
-      });
-
-      proc.on("close", async (code) => {
-        clearTimeout(firstByteTimer);
-        clearTimeout(heartbeatTimer);
-        clearTimeout(execTimer);
-        clearInterval(keepaliveInterval);
-        workerRelease(worker.name);
-
-        // Auth-related auto-heal: refresh token and retry same worker once
-        if (code !== 0 && !sentContent) {
-          const rateErr = isRateLimitError(code, stderrBuf) || isRateLimitError(code, buffer);
-          const classification = classifyCliError({
-            exitCode: code,
-            stderr: stderrBuf,
-            stdout: buffer,
-            err: { isRateLimit: rateErr },
-          });
-          if (classification.healable && CONFIG.autoHeal?.enabled !== false) {
-            const healResult = await autoHeal.heal(worker.name, classification.reason, reqId);
-            if (healResult?.success && retryCount < MAX_RETRIES) {
-              retryCount++;
-              console.log(`[${ts()}] AUTO_HEAL_RETRY reqId=${reqId} worker=${worker.name} reason=${classification.reason} -> retrying (attempt ${retryCount}/${MAX_RETRIES})`);
-              pipeStream(worker, true);
-              return;
-            }
-            const alt = getAlternateWorker(worker.name);
-            if (alt && retryCount < MAX_RETRIES) {
-              retryCount++;
-              console.log(`[${ts()}] AUTO_HEAL_FALLBACK reqId=${reqId} worker=${worker.name} -> ${alt.name} (attempt ${retryCount}/${MAX_RETRIES})`);
-              pipeStream(alt, true);
-              return;
-            }
-          }
-        }
-
-        // Quick-fail auto-retry: if worker failed fast with no content, try another
-        const elapsed = Date.now() - proc._spawnedAt;
-        if (code !== 0 && !sentContent && elapsed < QUICK_FAIL_MS && retryCount < MAX_RETRIES) {
-          // Find an untried router, or any alternate
-          const untried = retryPool.find(
-            (w) => !triedRouters.has(w.name) && isWorkerHealthy(w.name)
-          );
-          const alt = untried || getAlternateWorker(worker.name);
-          if (alt) {
-            retryCount++;
-            console.log(`[${ts()}] STREAM_RETRY reqId=${reqId} failedRouter=${worker.name} code=${code} elapsed=${elapsed}ms -> retrying on ${alt.name} (attempt ${retryCount}/${MAX_RETRIES})`);
-            recordWorkerError(worker.name, "stream_retry", `code=${code} elapsed=${elapsed}ms`);
-            eventLog.push("retry", { reqId, model, source, failedWorker: worker.name, retryWorker: alt.name, code, elapsed, retryCount });
-            pipeStream(alt, true);
-            return;  // don't finalize response — retry will handle it
-          }
-        }
-
-        release();
-        if (code !== 0) {
-          const diag = stderrBuf.trim() || buffer.trim().slice(0, 200) || "(no output)";
-          console.log(`[${ts()}] CLI_EXIT reqId=${reqId} code=${code} sent=${sentContent} router=${worker.name} stderr=${diag.slice(0, 300)}`);
-          const errCat = code === 143 ? "cli_killed" : "cli_crash";
-          recordWorkerError(worker.name, errCat, `code=${code} ${diag.slice(0, 100)}`);
-        }
-        const rateErr = isRateLimitError(code, stderrBuf) || isRateLimitError(code, buffer);
-        if (proc._workerName && rateErr) {
-          markWorkerLimited(proc._workerName, stderrBuf || buffer);
-        }
-        // Flush remaining buffer
-        const canWrite = !res.writableEnded;
-        if (buffer.trim()) {
-          try {
-            const ev = JSON.parse(buffer);
-            if (ev.type === "assistant" && ev.message?.content) {
-              for (const b of ev.message.content) {
-                if (b.type === "text" && b.text && canWrite) res.write(sseChunk(reqId, b.text));
-              }
-            } else if (ev.type === "result" && ev.result && !sentContent && canWrite) {
-              res.write(sseChunk(reqId, ev.result));
-            }
-            const usage = ev.usage || ev.message?.usage;
-            if (usage) {
-              const totalInput = (usage.input_tokens || usage.prompt_tokens || 0)
-                + (usage.cache_creation_input_tokens || 0)
-                + (usage.cache_read_input_tokens || 0);
-              reqTokens = { input: totalInput, output: usage.output_tokens || usage.completion_tokens || 0 };
-            }
-          } catch { /* ignore */ }
-        }
-        const finalInput = reqTokens.input > 0 ? reqTokens.input : inputEstimate;
-        const finalOutput = reqTokens.output > 0 ? reqTokens.output : Math.ceil(outputChars / 4);
-        tokenTracker.record(reqId, model, finalInput, finalOutput);
-        eventLog.push("complete", {
-          reqId, mode: "stream", model, source, exitCode: code,
-          inputTokens: finalInput, outputTokens: finalOutput,
-        });
-        sseBroadcast("complete", { reqId, model, source, exitCode: code, inputTokens: finalInput, outputTokens: finalOutput, worker: worker.name });
-
-        // Detect model safety refusals — log for diagnostics
-        // (The auth preamble should prevent most, but model training may still override)
-        if (sentContent && outputChars < 2000) {
-          const outputSnapshot = (buffer || "").toLowerCase();
-          const REFUSAL_PATTERNS = [
-            "i cannot", "i can't", "i'm not able", "i am not able",
-            "i won't", "i will not", "safety concern", "unauthorized access",
-            "not authorized", "security risk", "i must decline",
-            "cannot assist with", "unable to comply", "not comfortable",
-          ];
-          const isRefusal = REFUSAL_PATTERNS.some(p => outputSnapshot.includes(p));
-          if (isRefusal) {
-            console.log(`[${ts()}] SAFETY_REFUSAL reqId=${reqId} model=${model} router=${worker.name} outputLen=${outputChars} — model appears to have refused the task`);
-            eventLog.push("error", { kind: "safety_refusal", reqId, model, source, outputChars });
-            recordWorkerError(worker.name, "other", `safety_refusal model=${model}`);
-          }
-        }
-
-        if (code !== 0 && !sentContent) {
-          // All CLI routers failed — fall back to API endpoint
-          console.log(`[${ts()}] ALL_CLI_FAILED reqId=${reqId} retryCount=${retryCount} -> falling back to ${FALLBACK_API.name}`);
-          streamFromFallbackApi(originalMessages, model, reqId, source, res);
-          return;  // fallback handles res.end()
-        }
-        if (canWrite) {
-          res.write(sseChunk(reqId, null, "stop"));
-          res.write("data: [DONE]\n\n");
-          res.end();
-        }
-      });
-
-      proc.on("error", (err) => {
-        clearTimeout(firstByteTimer);
-        clearTimeout(heartbeatTimer);
-        clearTimeout(execTimer);
-        clearInterval(keepaliveInterval);
-        workerRelease(worker.name);
-        // Quick-fail auto-retry on spawn error too
-        if (!sentContent && retryCount < MAX_RETRIES) {
-          const untried = retryPool.find(
-            (w) => !triedRouters.has(w.name) && isWorkerHealthy(w.name)
-          );
-          const alt = untried || getAlternateWorker(worker.name);
-          if (alt) {
-            retryCount++;
-            console.log(`[${ts()}] STREAM_RETRY reqId=${reqId} failedRouter=${worker.name} error=${err.message} -> retrying on ${alt.name} (attempt ${retryCount}/${MAX_RETRIES})`);
-            pipeStream(alt, true);
-            return;
-          }
-        }
-        release();
-        // All CLI routers errored — fall back to API endpoint
-        console.log(`[${ts()}] ALL_CLI_FAILED reqId=${reqId} error=${err.message} -> falling back to ${FALLBACK_API.name}`);
-        streamFromFallbackApi(originalMessages, model, reqId, source, res);
-      });
-    }
-
-    // Start the stream pipeline (first attempt, no retry flag)
-    pipeStream(null, false);
-  } else {
-    try {
-      const allLimited = getAllLimitedStatus();
-      if (allLimited) {
-        const notice = formatLimitNotice(allLimited.nextReset);
-        try {
-          const fbResult = await fetchFallbackSync(messages, model, reqId, source);
-          release();
-          const combined = fbResult ? `${notice}
-
-${fbResult}` : notice;
-          sendJson(res, 200, completionResponse(reqId, combined, model));
-          return;
-        } catch (err) {
-          release();
-          const retrySec = allLimited.nextReset ? Math.max(0, Math.round((allLimited.nextReset - Date.now()) / 1000)) : null;
-          return sendError(res, 503, {
-            message: `Claude limit reached; retry after ${retrySec ?? "unknown"}s`,
-            type: "rate_limited",
-            retry_after_sec: retrySec,
-          });
-        }
-      }
-      const result = await runCli(prompt, model, systemPrompt, reqId, source, sessionKey);
-      release();
-      // Estimate tokens for sync: prompt chars/4 for input, result chars/4 for output
-      const syncInputTokens = Math.ceil(prompt.length / 4);
-      const syncOutputTokens = Math.ceil(result.length / 4);
-      tokenTracker.record(reqId, model, syncInputTokens, syncOutputTokens);
-      eventLog.push("complete", {
-        reqId, mode: "sync", model, source,
-        inputTokens: syncInputTokens, outputTokens: syncOutputTokens,
-      });
-      sendJson(res, 200, completionResponse(reqId, result, model, buildUsage({
-        inputTokens: syncInputTokens,
-        outputTokens: syncOutputTokens,
-      })));
-    } catch (err) {
-      if (err.isRateLimit) {
-        const allLimited = getAllLimitedStatus();
-        const notice = formatLimitNotice(allLimited?.nextReset);
-        try {
-          const fbResult = await fetchFallbackSync(messages, model, reqId, source);
-          release();
-          const combined = fbResult ? `${notice}
-
-${fbResult}` : notice;
-          sendJson(res, 200, completionResponse(reqId, combined, model));
-          return;
-        } catch (fbErr) {
-          release();
-          const retrySec = allLimited?.nextReset ? Math.max(0, Math.round((allLimited.nextReset - Date.now()) / 1000)) : null;
-          return sendError(res, 503, {
-            message: `Claude limit reached; retry after ${retrySec ?? "unknown"}s`,
-            type: "rate_limited",
-            retry_after_sec: retrySec,
-          });
-        }
-      }
-      release();
-      eventLog.push("error", { reqId, mode: "sync", model, source, error: err.message });
-      console.error(`[${ts()}] ERROR src=${source} ${err.message}`);
-      sendError(res, 500, { message: err.message, type: "internal_error" });
-    }
-  }
-}
-
-// ============================================================
-// Other endpoints
-// ============================================================
-
-function handleModels(req, res) {
-  const models = Object.keys(MODEL_MAP).map((id) => ({
-    id: `claude-code/${id}`,
-    object: "model",
-    created: Math.floor(Date.now() / 1000),
-    owned_by: "claude-code-proxy",
-  }));
-  sendJson(res, 200, { object: "list", data: models });
-}
-
-function getWorkerTokenReason(worker) {
-  const now = Date.now();
-  if (worker.disabled) return worker.disabledReason || "disabled";
-  if (!worker.token && !worker.refreshToken) return "no token";
-  if (worker.expiresAt && worker.expiresAt > 0 && worker.expiresAt <= now) return "expired";
-  return null;
-}
-
-function handleHealth(req, res) {
-  const qs = queue.getStats();
-  const rs = registry.getStats();
-  const workers = _workerPool.map((w) => {
-    const h = workerHealth.getState(w.name);
-    const until = h.limitedUntil || null;
-    const healState = autoHeal.getWorkerState(w.name);
-    return {
-      name: w.name,
-      bin: w.bin,
-      disabled: !!w.disabled,
-      disabledReason: w.disabledReason || null,
-      tokenReason: getWorkerTokenReason(w),
-      limited: !!h.limited,
-      limitedAt: h.limitedAt || null,
-      limitedAgoSec: h.limited ? Math.round((Date.now() - h.limitedAt) / 1000) : null,
-      limitedUntil: until,
-      limitedUntilIso: until ? new Date(until).toISOString() : null,
-      limitedRemainingSec: h.limited && until ? Math.max(0, Math.round((until - Date.now()) / 1000)) : null,
-      autoHeal: {
-        cooldownUntil: healState.cooldownUntil || null,
-        cooldownRemainingSec: healState.cooldownUntil ? Math.max(0, Math.round((healState.cooldownUntil - Date.now()) / 1000)) : null,
-        circuitState: healState.circuitState,
-        circuitOpenUntil: healState.circuitOpenUntil || null,
-        circuitRemainingSec: healState.circuitOpenUntil ? Math.max(0, Math.round((healState.circuitOpenUntil - Date.now()) / 1000)) : null,
-      },
-    };
-  });
-  sendJson(res, 200, {
-    status: "ok",
-    version: CONFIG.dashboard.version,
-    claude_bin: CLAUDE_BIN,
-    port: PORT,
-    redis: redis ? { connected: redis.isReady() } : { connected: false },
-    cliRouters: workers,
-    primaryRouter: PRIMARY_WORKER,
-    queue: { active: qs.active, queued: qs.totalQueued, max: qs.maxConcurrent, sources: qs.sourceCount, activeBySource: qs.activeBySource },
-    processes: { tracked: rs.total, byMode: rs.byMode, liveTokens: rs.liveTokens },
-    tokens: tokenTracker.getTotals(),
-    sessionAffinity: sessionAffinity.getStats(),
-    cache: getCacheStats(),
-    workerStats,
-    autoHeal: autoHeal.getStats(),
-    dashboard: CONFIG.dashboard,
-    portal: CONFIG.portal,
-  });
-}
-
-async function handleMetrics(req, res) {
-  const url = new URL(req.url, `http://0.0.0.0:${PORT}`);
-  const payload = await metricsController.buildMetricsResponse(url);
-  sendJson(res, 200, payload);
-}
-
-function handleSystemReaper(req, res) {
-  const stats = systemReaper.getStats();
-  sendJson(res, 200, {
-    stats,
-    config: systemReaper.config,
-  });
-}
-
-async function handleSystemReaperSweep(req, res) {
-  const result = systemReaper.sweep();
-  sendJson(res, 200, { result });
-}
-
-function handleWarmPool(req, res) {
-  sendJson(res, 200, warmPool.status());
-}
-
-function handleZombies(req, res) {
-  const zombies = registry.getZombies();
-  const qs = queue.getStats();
-  sendJson(res, 200, {
-    processes: registry.getAll(),
-    zombies,
-    stats: registry.getStats(),
-    activeLeases: qs.activeLeases,
-  });
-}
-
-async function handleKillZombie(req, res) {
-  let body;
-  try {
-    body = await readBody(req, MAX_BODY_BYTES);
-  } catch (err) {
-    return sendError(res, 413, { message: err.message || "Payload too large", type: "payload_too_large" });
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return sendError(res, 400, { message: "Invalid JSON body", type: "invalid_request" });
-  }
-
-  const { pid } = parsed;
-  if (!pid) return sendError(res, 400, { message: "pid required", type: "invalid_request" });
-
-  const result = registry.kill(Number(pid));
-  eventLog.push("kill", { pid: Number(pid), manual: true });
-  sendJson(res, 200, { result });
-}
-
-function handleEvents(req, res, url) {
-  const sinceId = parseInt(url.searchParams.get("since_id") || "0", 10);
-  const limit = parseInt(url.searchParams.get("limit") || "50", 10);
-  const type = url.searchParams.get("type") || null;
-  const events = eventLog.getRecent({ sinceId, limit, type });
-  sendJson(res, 200, { events, counts: eventLog.getCounts() });
-}
-
-function handleMetricsHistory(req, res, url) {
-  const window = url.searchParams.get("window") || "1h";
-  const validWindows = ["1h", "6h", "1d", "7d"];
-  if (!validWindows.includes(window)) {
-    return sendError(res, 400, { message: `Invalid window. Use: ${validWindows.join(", ")}`, type: "invalid_request" });
-  }
-  const points = metricsStore.query(window);
-  sendJson(res, 200, { window, points, count: points.length, bufferSize: metricsStore.getBufferSize() });
-}
-
-async function handlePortal(req, res) {
-  try {
-    const html = await readFile(join(__dirname, "portal.html"), "utf-8");
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    res.end(html);
-  } catch (err) {
-    sendError(res, 500, { message: "Portal file not found: " + err.message, type: "internal_error" });
-  }
-}
-
-async function handleProxyDashboard(req, res) {
-  try {
-    const html = await readFile(join(__dirname, "dashboard.html"), "utf-8");
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    res.end(html);
-  } catch (err) {
-    sendError(res, 500, { message: "Dashboard file not found: " + err.message, type: "internal_error" });
-  }
-}
+const requestHandler = createRequestHandler({
+  config: CONFIG,
+  queue,
+  rateLimiter,
+  sessionAffinity,
+  eventLog,
+  tokenTracker,
+  autoHeal,
+  tokenPool: TOKEN_POOL,
+  workerPool: _workerPool,
+  modelPriority: MODEL_PRIORITY,
+  resolveModel,
+  getNextToken,
+  waitForTokenCooldown,
+  getNextWorker,
+  workerAcquire,
+  workerRelease,
+  getAlternateWorker: (name) => workerRouter?.getAlternateWorker(name) || null,
+  extractPrompt,
+  buildCacheContext,
+  recordCacheCandidate,
+  recordCacheApplied,
+  recordCacheKey,
+  getCacheStats,
+  recordWorkerRequest,
+  recordWorkerError,
+  isRateLimitError,
+  markWorkerLimited,
+  isWorkerHealthy,
+  getAllLimitedStatus: () => workerHealth?.getAllLimitedStatus() || null,
+  formatLimitNotice,
+  streamFromAnthropicDirect,
+  callAnthropicDirect,
+  streamAnthropicNative,
+  callAnthropicNative,
+  streamFromFallbackApi,
+  fetchFallbackSync,
+  cliRunner,
+  sseChunk,
+  sseBroadcast,
+  sendJson,
+  sendError,
+  readBody,
+  identifySource,
+  getSessionIdForStats: (req) => getSessionIdForStats(req),
+  sessionStatsStore,
+  registry,
+  buildUsage,
+  completionResponse,
+  completionResponseWithTools,
+  heartbeatByModel: HEARTBEAT_BY_MODEL,
+  defaultHeartbeatMs: DEFAULT_HEARTBEAT_MS,
+  streamTimeoutMs: STREAM_TIMEOUT_MS,
+  maxBodyBytes: MAX_BODY_BYTES,
+  allowExplicitTokenOverride: ALLOW_EXPLICIT_TOKEN_OVERRIDE,
+  useCliAgents: USE_CLI_AGENTS,
+  enabledWorkers: _enabledWorkers,
+  classifyCliError,
+});
 
 // ============================================================
 // Utilities
@@ -2750,43 +1043,49 @@ const server = createServer(async (req, res) => {
   }
 
   try {
-    if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
-      await handleCompletions(req, res);
+    if (url.pathname === "/v1/messages" && req.method === "POST") {
+      // Native Anthropic /v1/messages — direct pass-through, no format conversion
+      await requestHandler.handleAnthropicMessages(req, res);
+    } else if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
+      await requestHandler.handleCompletions(req, res);
     } else if (url.pathname === "/v1/models" && req.method === "GET") {
-      handleModels(req, res);
+      adminRoutes.handleModels(req, res);
     } else if (url.pathname === "/health" && req.method === "GET") {
-      handleHealth(req, res);
+      adminRoutes.handleHealth(req, res);
     } else if (url.pathname === "/metrics" && req.method === "GET") {
-      await handleMetrics(req, res);
+      await adminRoutes.handleMetrics(req, res);
     } else if (url.pathname === "/rate-limits" && req.method === "GET") {
-      await handleMetrics(req, res); // backward compat
+      await adminRoutes.handleMetrics(req, res); // backward compat
     } else if (url.pathname === "/zombies" && req.method === "GET") {
-      handleZombies(req, res);
+      adminRoutes.handleZombies(req, res);
     } else if (url.pathname === "/zombies" && req.method === "POST") {
-      await handleKillZombie(req, res);
+      await adminRoutes.handleKillZombie(req, res);
     } else if (url.pathname === "/system-reaper" && req.method === "GET") {
-      handleSystemReaper(req, res);
+      adminRoutes.handleSystemReaper(req, res);
     } else if (url.pathname === "/system-reaper" && req.method === "POST") {
-      await handleSystemReaperSweep(req, res);
+      await adminRoutes.handleSystemReaperSweep(req, res);
     } else if (url.pathname === "/warm-pool" && req.method === "GET") {
-      handleWarmPool(req, res);
+      adminRoutes.handleWarmPool(req, res);
     } else if (url.pathname === "/events" && req.method === "GET") {
-      handleEvents(req, res, url);
+      adminRoutes.handleEvents(req, res, url);
     } else if (url.pathname === "/metrics/history" && req.method === "GET") {
-      handleMetricsHistory(req, res, url);
+      adminRoutes.handleMetricsHistory(req, res, url);
     } else if (url.pathname === "/stream" && req.method === "GET") {
-      handleSSEStream(req, res);
+      adminRoutes.handleSSEStream(req, res);
     } else if (url.pathname === "/token-refresh" && req.method === "POST") {
-      const chunks = []; for await (const c of req) chunks.push(c);
-      const { tokenName } = JSON.parse(Buffer.concat(chunks).toString());
-      const entry = TOKEN_POOL.find(t => t.name === tokenName);
-      if (!entry) return sendError(res, 404, { message: `Token ${tokenName} not found`, type: "not_found" });
-      const result = await tokenRefresher.handleAuthError(entry);
-      sendJson(res, 200, { result, status: tokenRefresher.getStatus() });
+      await adminRoutes.handleTokenRefresh(req, res);
+    } else if (url.pathname.match(/^\/workers\/([^/]+)\/disable$/) && req.method === "POST") {
+      const workerName = url.pathname.match(/^\/workers\/([^/]+)\/disable$/)[1];
+      await adminRoutes.handleWorkerDisable(req, res, workerName);
+    } else if (url.pathname.match(/^\/workers\/([^/]+)\/enable$/) && req.method === "POST") {
+      const workerName = url.pathname.match(/^\/workers\/([^/]+)\/enable$/)[1];
+      await adminRoutes.handleWorkerEnable(req, res, workerName);
+    } else if (url.pathname === "/workers" && req.method === "GET") {
+      adminRoutes.handleWorkersList(req, res);
     } else if (url.pathname === "/dashboard/proxy" || url.pathname === "/dashboard/proxy/") {
-      await handleProxyDashboard(req, res);
+      await adminRoutes.handleProxyDashboard(req, res);
     } else if (url.pathname === "/dashboard" || url.pathname === "/dashboard/") {
-      await handlePortal(req, res);
+      await adminRoutes.handlePortal(req, res);
     } else {
       sendError(res, 404, { message: "Not found", type: "not_found" });
     }
@@ -2817,6 +1116,7 @@ function shutdown(signal) {
   systemReaper.destroy();
   sessionAffinity.shutdown();
   tokenRefresher.destroy();
+  tokenHealthProbe.destroy();
 
   // Close Redis connection
   if (redis) {
@@ -2902,6 +1202,7 @@ server.listen(PORT, "0.0.0.0", async () => {
 
   metricsStore.startSampler(gatherMetricsSnapshot);
   tokenRefresher.start();
+  tokenHealthProbe.start();
 
   // Pre-warm worker pool: spawn processes for the most common configs
   if (WARM_POOL_ENABLED) {

@@ -72,6 +72,26 @@
   .bar-sm { height: 4px; background: var(--bg3); border-radius: 2px; overflow: hidden; margin-top: 2px; }
   .bar-sm .fill { height: 100%; border-radius: 2px; transition: width 0.4s ease; }
 
+  /* ── Routing Status Badge ── */
+  .wc-routing { font-size: 9px; padding: 1px 6px; border-radius: 8px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+  .wc-routing.preferred { background: rgba(63,185,80,0.18); color: var(--green); }
+  .wc-routing.active { background: rgba(88,166,255,0.15); color: var(--blue); }
+  .wc-routing.avoided { background: rgba(210,136,62,0.18); color: var(--orange); }
+  .wc-routing.blocked { background: rgba(248,81,73,0.18); color: var(--red); }
+
+  /* ── Tier Label ── */
+  .tier-label { font-size: 9px; padding: 1px 5px; border-radius: 3px; font-weight: 600; }
+  .tier-label.saturated { background: rgba(248,81,73,0.15); color: var(--red); }
+  .tier-label.strained { background: rgba(210,136,62,0.15); color: var(--orange); }
+  .tier-label.available { background: rgba(63,185,80,0.15); color: var(--green); }
+  .tier-label.unknown { background: rgba(139,148,158,0.12); color: var(--text2); }
+
+  /* ── Bottleneck Tag ── */
+  .bottleneck-tag { font-size: 9px; padding: 1px 5px; border-radius: 3px; background: rgba(188,140,255,0.15); color: var(--purple); font-weight: 500; margin-left: 4px; }
+
+  /* ── Reset Countdown ── */
+  .reset-countdown { color: var(--red); font-weight: 600; font-size: 11px; }
+
   /* ── Two-Column Grid ── */
   .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   @media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
@@ -383,10 +403,19 @@ async function fetchHistory() {
 }
 
 // ── Worker Card Renderer ──
-function renderWorkerCard(name, traffic, router, tokenHealth, unified, activeConns, windowStats) {
+function fmtCountdown(sec) {
+  if (!sec || sec <= 0) return '';
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (h > 0) return h + 'h ' + m + 'm';
+  return m + 'm';
+}
+
+function renderWorkerCard(name, traffic, router, tokenHealth, unified, activeConns, windowStats, enhanced) {
   const isLimited = router?.limited || false;
   const th = tokenHealth || {};
   const u = unified || {};
+  const enh = enhanced || {};
   const reqs = traffic?.requests || 0;
   const errs = traffic?.errors || 0;
   const winReqs = windowStats?.requests || 0;
@@ -409,6 +438,13 @@ function renderWorkerCard(name, traffic, router, tokenHealth, unified, activeCon
   const d7Color = d7Pct > 80 ? 'var(--red)' : d7Pct > 50 ? 'var(--yellow)' : 'var(--green)';
   const h5Color = h5Pct > 80 ? 'var(--red)' : h5Pct > 50 ? 'var(--yellow)' : 'var(--green)';
 
+  // Enhanced routing info
+  const routingStatus = enh.routingStatus || 'preferred';
+  const tier = enh.tier || 'unknown';
+  const bottleneck = enh.bottleneck || 'none';
+  const resetInSec = enh.resetInSec || null;
+  const effUtil = enh.effectiveUtil >= 0 ? Math.round(enh.effectiveUtil * 100) : null;
+
   // Status
   let statusClass = 'healthy', statusText = 'healthy';
   if (router?.disabled) { statusClass = 'disabled'; statusText = 'disabled'; }
@@ -416,7 +452,21 @@ function renderWorkerCard(name, traffic, router, tokenHealth, unified, activeCon
   else if (th.isRefreshing) { statusClass = 'refreshing'; statusText = 'refreshing'; }
 
   let html = `<div class="worker-card ${isLimited ? 'limited' : ''} ${router?.disabled ? 'disabled' : ''}">`;
-  html += `<div class="wc-header"><span class="wc-name">Worker ${name}</span><span class="wc-status ${statusClass}">${statusText}</span></div>`;
+  html += `<div class="wc-header">`;
+  html += `<span class="wc-name">Worker ${name}</span>`;
+  html += `<span style="display:flex;gap:4px;align-items:center">`;
+  if (enh.routingStatus) {
+    html += `<span class="wc-routing ${routingStatus}">${routingStatus}</span>`;
+  }
+  html += `<span class="wc-status ${statusClass}">${statusText}</span>`;
+  html += `</span></div>`;
+
+  // Effective utilization + tier (if enhanced data available)
+  if (effUtil !== null) {
+    const effColor = effUtil >= 99 ? 'var(--red)' : effUtil >= 75 ? 'var(--orange)' : 'var(--green)';
+    html += `<div class="wc-row"><span class="k">effective usage</span><span class="val" style="color:${effColor}">${effUtil}% <span class="tier-label ${tier}">${tier}</span></span></div>`;
+    html += `<div class="bar-sm"><div class="fill" style="width:${Math.min(effUtil,100)}%;background:${effColor}"></div></div>`;
+  }
 
   // Traffic
   html += `<div class="wc-row"><span class="k">requests</span><span class="val b">${reqs}</span></div>`;
@@ -442,10 +492,17 @@ function renderWorkerCard(name, traffic, router, tokenHealth, unified, activeCon
   // Unified limits (if data available)
   if (u.d7Utilization !== undefined) {
     html += '<hr class="wc-divider">';
-    html += `<div class="wc-row"><span class="k">7d usage</span><span class="val" style="color:${d7Color}">${d7Pct}%</span></div>`;
+    const d7Tag = bottleneck === 'seven_day' ? '<span class="bottleneck-tag">bottleneck</span>' : '';
+    const h5Tag = bottleneck === 'five_hour' ? '<span class="bottleneck-tag">bottleneck</span>' : '';
+    html += `<div class="wc-row"><span class="k">7d usage${d7Tag}</span><span class="val" style="color:${d7Color}">${d7Pct}%</span></div>`;
     html += `<div class="bar-sm"><div class="fill" style="width:${d7Pct}%;background:${d7Color}"></div></div>`;
-    html += `<div class="wc-row"><span class="k">5h usage</span><span class="val" style="color:${h5Color}">${h5Pct}%</span></div>`;
+    html += `<div class="wc-row"><span class="k">5h usage${h5Tag}</span><span class="val" style="color:${h5Color}">${h5Pct}%</span></div>`;
     html += `<div class="bar-sm"><div class="fill" style="width:${h5Pct}%;background:${h5Color}"></div></div>`;
+  }
+
+  // Reset countdown (only shown when 429 detected)
+  if (resetInSec && resetInSec > 0) {
+    html += `<div class="wc-row"><span class="k">resets in</span><span class="reset-countdown">${fmtCountdown(resetInSec)}</span></div>`;
   }
 
   // Rate limited info
@@ -474,6 +531,7 @@ async function refresh() {
     const ac = metrics.activeConnections || {};
     const tokenHealth = metrics.tokenRefreshStatus || {};
     const unified = metrics.unifiedRateLimits || {};
+    const rlEnhanced = metrics.rateLimitEnhanced || {};
 
     // ── Header ──
     document.getElementById('version').textContent = 'v' + (cfg.version || '0.7.0');
@@ -541,6 +599,7 @@ async function refresh() {
         unified[name],
         ac[name] || 0,
         wsWindow.traffic?.[name],
+        rlEnhanced[name],
       );
     }
     if (allWorkerNames.length === 0) {

@@ -94,6 +94,7 @@ function listProcesses() {
     const output = execFileSync("ps", ["-eo", "pid,ppid,etime,command"], {
       encoding: "utf-8",
       timeout: 10_000,
+      maxBuffer: 10_000_000, // 10MB — prevent ENOBUFS on large process lists
     });
 
     const lines = output.split("\n").slice(1); // skip header
