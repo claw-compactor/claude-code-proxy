@@ -140,10 +140,7 @@ const TOKEN_POOL = buildTokenPool(_workerPool);
 // Token health manager: unified state machine for per-token health
 const tokenHealthManager = createTokenHealthManager({
   tokenPool: TOKEN_POOL,
-  maxHealAttempts: 5,
-  deadBackoffMs: 1_800_000,   // 30 min
-  degradedProbeMs: 60_000,    // 1 min
-  healthyProbeMs: 300_000,    // 5 min
+  ...CONFIG.tokenHealth,
   eventLog,
   log: console.log,
 });
@@ -155,8 +152,7 @@ const { getNextToken, setTokenCooldown, getTokenCooldownMs, waitForTokenCooldown
 const tokenRefresher = createTokenRefresher({
   tokenPool: TOKEN_POOL,
   configPath: join(__dirname, "proxy.config.json"),
-  proactiveMarginMs: 3_600_000, // 1 hour before expiry (aggressive)
-  maxBackoffMs: 300_000,
+  ...CONFIG.tokenRefresh,
   claudeBin: CLAUDE_BIN,
 });
 
@@ -166,7 +162,7 @@ const tokenHealthProbe = createTokenHealthProbe({
   apiBase: ANTHROPIC_API_BASE,
   apiVersion: ANTHROPIC_API_VERSION,
   modelIds: ANTHROPIC_MODEL_IDS,
-  intervalMs: 300_000, // 5 min
+  intervalMs: CONFIG.tokenHealth.healthyProbeMs,
   tokenRefresher,
   captureUnifiedRateHeaders,
   setTokenCooldown,
@@ -425,7 +421,7 @@ function resolveModel(model) {
 // Redis — connect first, then pass to all modules
 let redis = null;
 try {
-  redis = await createRedisClient();
+  redis = await createRedisClient(CONFIG.redis);
   console.log("[Redis] Connected and ready");
 } catch (err) {
   console.warn(`[Redis] Connection failed: ${err.message} — running in memory-only mode`);
@@ -719,23 +715,8 @@ const MAX_BODY_BYTES = CONFIG.limits?.maxBodyBytes || 5_000_000;
 const MAX_PROMPT_TOKENS = CONFIG.limits?.maxPromptTokens || 190000;
 const APPROX_CHARS_PER_TOKEN = 3; // conservative to avoid 200k hard limit
 
-// Anthropic cache_control tuning
-const CACHE_CONTROL_ENABLED = CONFIG.cacheControl?.enabled ?? true;
-const CACHE_SYSTEM_PREFIX_CHARS = CONFIG.cacheControl?.systemPrefixChars ?? 1200;
-const CACHE_SYSTEM_MIN_PREFIX_CHARS = CONFIG.cacheControl?.minSystemPrefixChars ?? 200;
-const CACHE_NORMALIZE_SYSTEM_PREFIX = CONFIG.cacheControl?.normalizeSystemPrefix ?? true;
-const CACHE_DEBOUNCE_WHITESPACE = CONFIG.cacheControl?.debounceWhitespace ?? true;
-const CACHE_SESSION_SCOPE = CONFIG.cacheControl?.sessionScope ?? "x-session-id"; // "x-session-id" | "none"
-
 // ── Format converter wrappers: bind config to extracted pure functions ──
-const _cacheConfig = Object.freeze({
-  enabled: CACHE_CONTROL_ENABLED,
-  systemPrefixChars: CACHE_SYSTEM_PREFIX_CHARS,
-  minSystemPrefixChars: CACHE_SYSTEM_MIN_PREFIX_CHARS,
-  normalizeSystemPrefix: CACHE_NORMALIZE_SYSTEM_PREFIX,
-  debounceWhitespace: CACHE_DEBOUNCE_WHITESPACE,
-  sessionScope: CACHE_SESSION_SCOPE,
-});
+const _cacheConfig = Object.freeze({ ...CONFIG.cacheControl });
 function extractPrompt(messages) { return _extractPrompt(messages, MAX_PROMPT_CHARS); }
 function buildCacheContext(args) { return _buildCacheContext({ ...args, cacheConfig: _cacheConfig }); }
 function buildAnthropicSystemBlocks(systemText, cacheCtx) { return _buildAnthropicSystemBlocks(systemText, cacheCtx, _cacheConfig); }
@@ -802,6 +783,9 @@ function getAnthropicClient() {
       apiVersion: ANTHROPIC_API_VERSION,
       modelIds: ANTHROPIC_MODEL_IDS,
       maxPromptTokens: MAX_PROMPT_TOKENS,
+      defaultMaxTokens: CONFIG.anthropic.defaultMaxTokens,
+      rateLimitRetryMs: CONFIG.retry.rateLimitRetryMs,
+      serverErrorRetryMs: CONFIG.retry.serverErrorRetryMs,
       syncTimeoutMs: SYNC_TIMEOUT_MS,
       cacheConfig: _cacheConfig,
       tokenRefresher,
@@ -950,6 +934,9 @@ const requestHandler = createRequestHandler({
   defaultHeartbeatMs: DEFAULT_HEARTBEAT_MS,
   streamTimeoutMs: STREAM_TIMEOUT_MS,
   maxBodyBytes: MAX_BODY_BYTES,
+  quickFailMs: CONFIG.retry.quickFailMs,
+  maxRateWaitMs: CONFIG.retry.maxRateWaitMs,
+  serverErrorRetryMs: CONFIG.retry.serverErrorRetryMs,
   allowExplicitTokenOverride: ALLOW_EXPLICIT_TOKEN_OVERRIDE,
   useCliAgents: USE_CLI_AGENTS,
   enabledWorkers: _enabledWorkers,

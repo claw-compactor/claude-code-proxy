@@ -9,22 +9,22 @@
 
 import Redis from "ioredis";
 
-const DEFAULTS = Object.freeze({
-  url: process.env.REDIS_URL || "redis://127.0.0.1:6379",
-  keyPrefix: "ccp:",
-  maxReconnectAttempts: 20,
-  connectTimeout: 5000,
-});
-
 /**
  * Create a shared Redis client.
- * @param {object} [options]
+ * @param {object} [options] - Typically CONFIG.redis from config-loader
  * @param {string} [options.url] - Redis URL (default: redis://127.0.0.1:6379)
  * @param {string} [options.keyPrefix] - Key prefix (default: "ccp:")
+ * @param {number} [options.maxReconnectAttempts] - Max reconnect attempts (default: 20)
+ * @param {number} [options.connectTimeout] - Connect timeout ms (default: 5000)
  * @returns {Promise<{client, isReady, quit, ping, prefix}>}
  */
 export async function createRedisClient(options = {}) {
-  const config = Object.freeze({ ...DEFAULTS, ...options });
+  const config = Object.freeze({
+    url: options.url ?? process.env.REDIS_URL ?? "redis://127.0.0.1:6379",
+    keyPrefix: options.keyPrefix ?? "ccp:",
+    maxReconnectAttempts: options.maxReconnectAttempts ?? 20,
+    connectTimeout: options.connectTimeout ?? 5000,
+  });
 
   const client = new Redis(config.url, {
     keyPrefix: config.keyPrefix,

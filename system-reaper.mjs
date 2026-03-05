@@ -19,14 +19,7 @@
 import { execFileSync } from "node:child_process";
 
 // ── Configuration ─────────────────────────────────────────────────────
-
-const DEFAULTS = Object.freeze({
-  intervalMs: 300_000,          // 5 minutes between sweeps
-  shellMaxAgeSec: 1800,         // 30 min — orphan shells older than this get killed
-  proxyIdleThresholdSec: 600,   // 10 min — stuck proxy workers
-  cliMinAgeSec: 300,            // 5 min — orphan CLI commands
-  helperMinAgeSec: 1800,        // 30 min — orphan pipe helpers (python, ssh, head, tail)
-});
+// Defaults removed — values provided by CONFIG.systemReaper via constructor.
 
 // Known CLI subcommand patterns (transient, NOT daemons)
 const CLI_PATTERNS = Object.freeze([
@@ -314,7 +307,14 @@ function reapOrphanCli(allProcs, config) {
  * @param {number} [options.helperMinAgeSec]
  */
 export function createSystemReaper(options = {}) {
-  const config = Object.freeze({ ...DEFAULTS, ...options });
+  const config = Object.freeze({
+    intervalMs: options.intervalMs ?? 300_000,
+    shellMaxAgeSec: options.shellMaxAgeSec ?? 1800,
+    proxyIdleThresholdSec: options.proxyIdleThresholdSec ?? 600,
+    cliMinAgeSec: options.cliMinAgeSec ?? 300,
+    helperMinAgeSec: options.helperMinAgeSec ?? 1800,
+    ...options,
+  });
 
   let onReapCallback = null;
   let reaperInterval = null;

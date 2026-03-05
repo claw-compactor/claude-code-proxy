@@ -218,6 +218,10 @@ export function loadConfig() {
 
   const maxRetries = resolve(file, "retry.maxRetries", "MAX_RETRIES", 3, toInt);
   const retryBaseMs = resolve(file, "retry.retryBaseMs", "RETRY_BASE_MS", 2000, toInt);
+  const rateLimitRetryMs = resolve(file, "retry.rateLimitRetryMs", "RETRY_RATE_LIMIT_MS", 30000, toInt);
+  const serverErrorRetryMs = resolve(file, "retry.serverErrorRetryMs", "RETRY_SERVER_ERROR_MS", 2000, toInt);
+  const quickFailMs = resolve(file, "retry.quickFailMs", "RETRY_QUICK_FAIL_MS", 5000, toInt);
+  const maxRateWaitMs = resolve(file, "retry.maxRateWaitMs", "RETRY_MAX_RATE_WAIT_MS", 300000, toInt);
 
   const maxProcessAgeMs = resolve(file, "process.maxProcessAgeMs", "MAX_PROCESS_AGE_MS", 7200000, toInt);
   const maxIdleMs = resolve(file, "process.maxIdleMs", "MAX_IDLE_MS", 3600000, toInt);
@@ -250,6 +254,7 @@ export function loadConfig() {
 
   const anthropicApiBase = resolve(file, "anthropic.apiBase", "ANTHROPIC_API_BASE", "https://api.anthropic.com");
   const anthropicApiVersion = resolve(file, "anthropic.apiVersion", "ANTHROPIC_API_VERSION", "2023-06-01");
+  const anthropicDefaultMaxTokens = resolve(file, "anthropic.defaultMaxTokens", "ANTHROPIC_DEFAULT_MAX_TOKENS", 16384, toInt);
   // Model IDs: proxy.config.json is authoritative for Anthropic model IDs.
   // These are the actual Anthropic API model strings (e.g., "claude-sonnet-4-6").
   const anthropicModels = {
@@ -280,6 +285,26 @@ export function loadConfig() {
   const maxPromptChars = resolve(file, "limits.maxPromptChars", "MAX_PROMPT_CHARS", 50000, toInt);
   const maxPromptTokens = resolve(file, "limits.maxPromptTokens", "MAX_PROMPT_TOKENS", 190000, toInt);
   const maxBodyBytes = resolve(file, "limits.maxBodyBytes", "MAX_BODY_BYTES", 5_000_000, toInt);
+  const errorTruncateChars = resolve(file, "limits.errorTruncateChars", "ERROR_TRUNCATE_CHARS", 200, toInt);
+
+  const redis = {
+    url: resolve(file, "redis.url", "REDIS_URL", "redis://127.0.0.1:6379"),
+    keyPrefix: resolve(file, "redis.keyPrefix", "REDIS_KEY_PREFIX", "ccp:"),
+    maxReconnectAttempts: resolve(file, "redis.maxReconnectAttempts", "REDIS_MAX_RECONNECT", 20, toInt),
+    connectTimeout: resolve(file, "redis.connectTimeout", "REDIS_CONNECT_TIMEOUT", 5000, toInt),
+  };
+
+  const tokenHealth = {
+    maxHealAttempts: resolve(file, "tokenHealth.maxHealAttempts", "TOKEN_HEALTH_MAX_HEAL", 5, toInt),
+    deadBackoffMs: resolve(file, "tokenHealth.deadBackoffMs", "TOKEN_HEALTH_DEAD_BACKOFF_MS", 1_800_000, toInt),
+    degradedProbeMs: resolve(file, "tokenHealth.degradedProbeMs", "TOKEN_HEALTH_DEGRADED_PROBE_MS", 60_000, toInt),
+    healthyProbeMs: resolve(file, "tokenHealth.healthyProbeMs", "TOKEN_HEALTH_HEALTHY_PROBE_MS", 300_000, toInt),
+  };
+
+  const tokenRefresh = {
+    proactiveMarginMs: resolve(file, "tokenRefresh.proactiveMarginMs", "TOKEN_REFRESH_MARGIN_MS", 3_600_000, toInt),
+    maxBackoffMs: resolve(file, "tokenRefresh.maxBackoffMs", "TOKEN_REFRESH_MAX_BACKOFF_MS", 300_000, toInt),
+  };
 
   const systemReaper = {
     intervalMs: resolve(file, "systemReaper.intervalMs", "SYSTEM_REAPER_INTERVAL_MS", 300000, toInt),
@@ -298,7 +323,7 @@ export function loadConfig() {
 
   const dashboard = {
     version: resolve(file, "dashboard.version", null, "0.7.0"),
-    refreshMs: resolve(file, "dashboard.refreshMs", null, 2000, toInt),
+    refreshMs: resolve(file, "dashboard.refreshMs", null, 5000, toInt),
     historyRefreshMs: resolve(file, "dashboard.historyRefreshMs", null, 10000, toInt),
     reaperRefreshMs: resolve(file, "dashboard.reaperRefreshMs", null, 30000, toInt),
     eventsLimit: resolve(file, "dashboard.eventsLimit", null, 100, toInt),
@@ -367,16 +392,19 @@ export function loadConfig() {
       defaultSourceConcurrency,
     },
     timeouts: { streamTimeoutMs, syncTimeoutMs },
-    retry: { maxRetries, retryBaseMs },
+    retry: { maxRetries, retryBaseMs, rateLimitRetryMs, serverErrorRetryMs, quickFailMs, maxRateWaitMs },
     process: { maxProcessAgeMs, maxIdleMs, reaperIntervalMs },
     warmPool: { enabled: warmPoolEnabled, size: warmPoolSize, maxAgeMs: warmPoolMaxAgeMs },
     sessionAffinity: { ttlMs: sessionAffinityTtlMs },
     sessionStats: { ttlMs: sessionStatsTtlMs, cleanupIntervalMs: sessionStatsCleanupMs, topN: sessionStatsTopN },
     cacheControl,
     rateLimits,
-    anthropic: { apiBase: anthropicApiBase, apiVersion: anthropicApiVersion, models: anthropicModels },
+    anthropic: { apiBase: anthropicApiBase, apiVersion: anthropicApiVersion, defaultMaxTokens: anthropicDefaultMaxTokens, models: anthropicModels },
     fallback,
-    limits: { maxPromptChars, maxPromptTokens, maxBodyBytes },
+    limits: { maxPromptChars, maxPromptTokens, maxBodyBytes, errorTruncateChars },
+    redis,
+    tokenHealth,
+    tokenRefresh,
     systemReaper,
     heartbeat,
     dashboard,

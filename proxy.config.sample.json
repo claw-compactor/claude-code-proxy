@@ -62,7 +62,11 @@
   },
   "retry": {
     "maxRetries": 3,
-    "retryBaseMs": 2000
+    "retryBaseMs": 2000,
+    "rateLimitRetryMs": 30000,
+    "serverErrorRetryMs": 2000,
+    "quickFailMs": 5000,
+    "maxRateWaitMs": 300000
   },
   "process": {
     "maxProcessAgeMs": 7200000,
@@ -91,6 +95,7 @@
   "anthropic": {
     "apiBase": "https://api.anthropic.com",
     "apiVersion": "2023-06-01",
+    "defaultMaxTokens": 16384,
     "models": {
       "sonnet": "claude-sonnet-4-6",
       "opus": "claude-opus-4-6",
@@ -106,7 +111,24 @@
   "limits": {
     "maxPromptChars": 50000,
     "maxPromptTokens": 190000,
-    "maxBodyBytes": 5000000
+    "maxBodyBytes": 5000000,
+    "errorTruncateChars": 200
+  },
+  "redis": {
+    "url": "redis://127.0.0.1:6379",
+    "keyPrefix": "ccp:",
+    "maxReconnectAttempts": 20,
+    "connectTimeout": 5000
+  },
+  "tokenHealth": {
+    "maxHealAttempts": 5,
+    "deadBackoffMs": 1800000,
+    "degradedProbeMs": 60000,
+    "healthyProbeMs": 300000
+  },
+  "tokenRefresh": {
+    "proactiveMarginMs": 3600000,
+    "maxBackoffMs": 300000
   },
   "systemReaper": {
     "intervalMs": 300000,
