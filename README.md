@@ -29,6 +29,12 @@ Clients (OpenAI format)
       Anthropic API (api.anthropic.com)
 ```
 
+### Control Layer (Controllers)
+
+- **StorageController** — unified Redis/local fallback for cache/session/worker stats
+- **MetricsController** — metrics aggregation + /metrics compatibility output
+- **WorkerHealthController** — worker health state machine with circuit breaker + cooldown recovery
+
 ### Request Flow
 
 1. Client sends OpenAI-format request (`/v1/chat/completions`)
@@ -42,6 +48,10 @@ Clients (OpenAI format)
 | Module | Purpose |
 |--------|---------|
 | `server.mjs` | Main server: routing, API translation, streaming |
+| `controllers/storage-controller.mjs` | Unified storage control (Redis/local fallback) |
+| `controllers/metrics-controller.mjs` | Metrics aggregation + compatibility output |
+| `controllers/worker-health-controller.mjs` | Worker health state machine + circuit breaker |
+| `storage-backend.mjs` | Redis/local persistence for analytics snapshots |
 | `config-loader.mjs` | Loads and validates `proxy.config.json` |
 | `token-refresh.mjs` | OAuth token auto-refresh (proactive + on-401) |
 | `auto-heal.mjs` | Request-level auto-heal for CLI auth failures |

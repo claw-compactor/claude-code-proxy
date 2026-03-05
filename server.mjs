@@ -39,12 +39,9 @@ import { createWarmPool } from "./worker-pool.mjs";
 import { loadConfig } from "./config-loader.mjs";
 import { createTokenRefresher } from "./token-refresh.mjs";
 import { createAutoHealManager, classifyCliError } from "./auto-heal.mjs";
-import {
-  createStorageBackend,
-  createCacheStatsStore,
-  createSessionStatsStore,
-  createWorkerStatsStore,
-} from "./storage-backend.mjs";
+import { createStorageController } from "./controllers/storage-controller.mjs";
+import { createMetricsController } from "./controllers/metrics-controller.mjs";
+import { createWorkerHealthController } from "./controllers/worker-health-controller.mjs";
 import {
   sseChunk, sseToolCallStartChunk, sseToolCallDeltaChunk, sseFinishChunk,
   completionResponse, completionResponseWithTools,
@@ -82,11 +79,8 @@ const ALLOW_EXPLICIT_TOKEN_OVERRIDE = CONFIG.routing.allowExplicitTokenOverride 
 const _workerPool = CONFIG.workers;
 const _enabledWorkers = () => _workerPool.filter(w => !w.disabled);
 
-// Worker health state
-const _workerHealth = new Map(); // name -> { limited: boolean, limitedAt: number, limitedUntil: number }
-for (const w of _workerPool) {
-  _workerHealth.set(w.name, { limited: false, limitedAt: 0, limitedUntil: 0 });
-}
+// Worker health controller (initialized after eventLog is available)
+let workerHealth = null;
 
 // Round-robin index for load-balancing mode
 let _rrIndex = 0;
@@ -306,49 +300,18 @@ function recordWorkerError(workerName, category, detail) {
   else workerStats.errors.other++;
   workerStats.recentErrors.push({ ts: Date.now(), worker: workerName, category, detail: (detail || "").slice(0, 200) });
   if (workerStats.recentErrors.length > 100) workerStats.recentErrors.shift();
+  if (category && category !== "rate_limit") {
+    workerHealth?.recordFailure(workerName, category);
+  }
   scheduleWorkerStatsPersist();
 }
 
 function computeWorkerWindowStats(windowMs = 60 * 60 * 1000) {
-  const cutoff = Date.now() - windowMs;
-  const raw = metricsStore.getRawBuffer().filter((e) => (e.ts || 0) * 1000 >= cutoff && e.workers);
-  if (raw.length === 0) return { windowMs, traffic: {}, samples: 0 };
-
-  const sorted = raw.sort((a, b) => a.ts - b.ts);
-  const first = sorted[0];
-  const last = sorted[sorted.length - 1];
-  const names = new Set([
-    ...Object.keys(first.workers || {}),
-    ...Object.keys(last.workers || {}),
-  ]);
-  const traffic = {};
-  for (const name of names) {
-    const f = first.workers?.[name] || { r: 0, e: 0 };
-    const l = last.workers?.[name] || { r: 0, e: 0 };
-    const reqDelta = l.r - f.r;
-    const errDelta = l.e - f.e;
-    traffic[name] = {
-      requests: reqDelta >= 0 ? reqDelta : l.r || 0,
-      errors: errDelta >= 0 ? errDelta : l.e || 0,
-    };
-  }
-  return { windowMs, traffic, samples: sorted.length, startTs: first.ts, endTs: last.ts };
+  return metricsController?.computeWorkerWindowStats(windowMs) || { windowMs, traffic: {}, samples: 0 };
 }
 
 function seedWorkerStatsFromHistory() {
-  const raw = metricsStore.getRawBuffer();
-  if (!raw || raw.length === 0) return false;
-  const last = raw[raw.length - 1];
-  if (!last?.workers) return false;
-  for (const [name, stats] of Object.entries(last.workers)) {
-    if (!workerStats.traffic[name]) {
-      workerStats.traffic[name] = { requests: 0, errors: 0, lastReqAt: null };
-    }
-    workerStats.traffic[name].requests = stats.r || 0;
-    workerStats.traffic[name].errors = stats.e || 0;
-    workerStats.traffic[name].lastReqAt = stats.last || null;
-  }
-  return true;
+  return metricsController?.seedWorkerStatsFromHistory() || false;
 }
 
 // Cache stats: prompt caching eligibility + TTFT comparison
@@ -384,9 +347,7 @@ function getSessionIdForStats(req) {
   return req?.headers?.["x-session-id"] || "";
 }
 
-// _loadBalanceMode starts true: round-robin across all healthy workers
-// Falls back to single-worker mode when one worker is rate-limited
-let _loadBalanceMode = LOAD_BALANCE_ENABLED;
+// load balance mode managed by WorkerHealthController
 
 // Active connection tracking — for least-connections routing
 const _activeConns = new Map(_workerPool.map(w => [w.name, 0]));
@@ -427,7 +388,7 @@ function leastLoadedWorker(pool) {
  * @returns {object} worker from _workerPool
  */
 function getNextWorker(sessionKey) {
-  const isHealthy = (name) => isWorkerHealthy(name);
+  const isHealthy = (name) => workerHealth?.isHealthy(name);
   const enabled = _enabledWorkers();
   const pool = enabled.length > 0 ? enabled : _workerPool;
   const healthy = pool.filter((w) => isHealthy(w.name));
@@ -435,7 +396,7 @@ function getNextWorker(sessionKey) {
   if (healthy.length === 0) {
     // All workers limited — pick the one that was limited longest ago
     const sorted = [...pool].sort(
-      (a, b) => _workerHealth.get(a.name).limitedAt - _workerHealth.get(b.name).limitedAt,
+      (a, b) => (workerHealth?.getState(a.name)?.limitedAt || 0) - (workerHealth?.getState(b.name)?.limitedAt || 0),
     );
     console.log(`[CLIRouter] ALL LIMITED — trying oldest-limited: ${sorted[0].name}`);
     return sorted[0];
@@ -446,7 +407,7 @@ function getNextWorker(sessionKey) {
   }
 
   // Degraded mode: only use primary
-  if (!_loadBalanceMode) {
+  if (!workerHealth?.getLoadBalanceMode()) {
     const primary = healthy.find((w) => w.name === PRIMARY_WORKER);
     return primary || healthy[0];
   }
@@ -471,51 +432,12 @@ function getNextWorker(sessionKey) {
   return least;
 }
 
-function parseResetTimeFromText(text) {
-  if (!text) return null;
-  const m = text.match(/reset[s]?(?:\s+at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
-  if (!m) return null;
-  let hour = parseInt(m[1], 10);
-  const minute = m[2] ? parseInt(m[2], 10) : 0;
-  const ampm = m[3].toLowerCase();
-  if (ampm === "pm" && hour < 12) hour += 12;
-  if (ampm === "am" && hour == 12) hour = 0;
-  const now = new Date();
-  const target = new Date(now);
-  target.setHours(hour, minute, 0, 0);
-  if (target.getTime() <= now.getTime()) {
-    target.setDate(target.getDate() + 1);
-  }
-  return target.getTime();
-}
-
 function markWorkerLimited(workerName, errText = "") {
-  const h = _workerHealth.get(workerName);
-  if (h && !h.limited) {
-    h.limited = true;
-    h.limitedAt = Date.now();
-    const resetAt = parseResetTimeFromText(errText);
-    h.limitedUntil = resetAt || (Date.now() + HEALTH_CHECK_MS);
-    _loadBalanceMode = false; // back to single-worker mode
-    const enabled = _enabledWorkers();
-    const pool = enabled.length > 0 ? enabled : _workerPool;
-    const other = pool.find((w) => w.name !== workerName);
-    const untilStr = h.limitedUntil ? new Date(h.limitedUntil).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }) : "unknown";
-    console.log(`[CLIRouter] ${workerName} RATE LIMITED — switching all traffic to ${other?.name || "?"} (cooldown until ${untilStr})`);
-    eventLog.push("worker_limited", { worker: workerName, switchedTo: other?.name, limitedUntil: h.limitedUntil || null });
-  }
+  workerHealth?.markLimited(workerName, errText);
 }
 
-function markWorkerRecovered(workerName) {
-  const h = _workerHealth.get(workerName);
-  if (h && h.limited) {
-    h.limited = false;
-    h.limitedAt = 0;
-    h.limitedUntil = 0;
-    _loadBalanceMode = LOAD_BALANCE_ENABLED; // both workers healthy → share the load (if enabled)
-    console.log(`[CLIRouter] ${workerName} RECOVERED — entering load-balance mode (round-robin)`);
-    eventLog.push("worker_recovered", { worker: workerName, loadBalance: _loadBalanceMode });
-  }
+function markWorkerRecovered(workerName, reason = "cooldown_expired") {
+  workerHealth?.markRecovered(workerName, reason);
 }
 
 function isRateLimitError(exitCode, stderr) {
@@ -531,28 +453,12 @@ function isRateLimitError(exitCode, stderr) {
 }
 
 function isWorkerHealthy(name) {
-  const h = _workerHealth.get(name);
-  if (!h?.limited) return true;
-  if (h.limitedUntil && Date.now() >= h.limitedUntil) {
-    markWorkerRecovered(name);
-    return true;
-  }
-  return false;
+  return workerHealth?.isHealthy(name);
 }
 
 // Health check timer: every HEALTH_CHECK_MS, try to recover limited workers
 setInterval(() => {
-  const enabled = _enabledWorkers();
-  const pool = enabled.length > 0 ? enabled : _workerPool;
-  for (const w of pool) {
-    const h = _workerHealth.get(w.name);
-    if (!h?.limited) continue;
-    const until = h.limitedUntil || (h.limitedAt + HEALTH_CHECK_MS);
-    if (Date.now() >= until) {
-      console.log(`[CLIRouter] Health check: ${w.name} cooldown expired (${Math.round((Date.now() - h.limitedAt) / 1000)}s) — marking recovered`);
-      markWorkerRecovered(w.name);
-    }
-  }
+  workerHealth?.tick();
 }, Math.min(HEALTH_CHECK_MS, 60000)); // Check at least every 60s
 
 // Whitelist of env vars safe to pass to CLI workers.
@@ -671,24 +577,17 @@ try {
 
 // Unified storage backend (Redis-first, local fallback)
 const CACHE_KEY_MAX_ENTRIES = CONFIG.cacheControl?.keyMaxEntries ?? 5000;
-storageBackend = createStorageBackend({
+const storageController = createStorageController({
   redis,
-  backend: CONFIG.storage?.backend || "redis",
+  storageConfig: { backend: CONFIG.storage?.backend || "redis" },
+  cacheConfig: { keyMaxEntries: CACHE_KEY_MAX_ENTRIES },
+  sessionConfig: CONFIG.sessionStats,
 });
-await storageBackend.ready;
-cacheStatsStore = createCacheStatsStore({
-  storage: storageBackend,
-  maxRecentKeys: CACHE_KEY_MAX_ENTRIES,
-});
-await cacheStatsStore.load();
-workerStatsStore = createWorkerStatsStore({ storage: storageBackend });
-await workerStatsStore.load();
-sessionStatsStore = createSessionStatsStore({
-  storage: storageBackend,
-  ttlMs: CONFIG.sessionStats?.ttlMs,
-  cleanupIntervalMs: CONFIG.sessionStats?.cleanupIntervalMs,
-  topN: CONFIG.sessionStats?.topN,
-});
+await storageController.init();
+storageBackend = storageController.storage;
+cacheStatsStore = storageController.cacheStats;
+workerStatsStore = storageController.workerStatsStore;
+sessionStatsStore = storageController.sessionStats;
 
 // Seed worker stats from storage snapshot if available
 const storedWorkerStats = workerStatsStore.get();
@@ -736,6 +635,18 @@ const retryPolicy = createRetryPolicy({
 const eventLog = createEventLog({ maxEvents: 500, redis });
 const tokenTracker = createTokenTracker({ redis });
 
+// Worker health controller: rate-limit cooldown + circuit breaker
+workerHealth = createWorkerHealthController({
+  workers: _workerPool,
+  primaryWorker: PRIMARY_WORKER,
+  healthCheckMs: HEALTH_CHECK_MS,
+  loadBalanceEnabled: LOAD_BALANCE_ENABLED,
+  circuitFailThreshold: CONFIG.workerHealth?.circuitFailThreshold ?? 3,
+  circuitOpenMs: CONFIG.workerHealth?.circuitOpenMs ?? 60_000,
+  circuitWindowMs: CONFIG.workerHealth?.circuitWindowMs ?? 60_000,
+  eventLog,
+});
+
 // Metrics store: persistent time-series data for dashboard charts
 const metricsStore = createMetricsStore({ redis });
 
@@ -764,6 +675,26 @@ const warmPool = createWarmPool({
   buildArgs: (model, isStream) => buildCliArgs(null, model, null, isStream),
   buildEnv: (worker) => workerEnv(worker),
   log: (msg) => console.log(`[${ts()}] ${msg}`),
+});
+
+const metricsController = createMetricsController({
+  metricsStore,
+  queue,
+  registry,
+  rateLimiter,
+  tokenTracker,
+  sessionStatsStore,
+  cacheStatsStore,
+  workerHealth,
+  autoHeal,
+  config: CONFIG,
+  workerStats,
+  sessionAffinity,
+  systemReaper,
+  getUnifiedRateLimits,
+  tokenRefresher,
+  activeConnections: _activeConns,
+  getWorkerTokenReason,
 });
 
 // Wire reaper events into event log + SSE
@@ -1367,17 +1298,7 @@ function getAlternateWorker(excludeName) {
 }
 
 function getAllLimitedStatus() {
-  const enabled = _enabledWorkers();
-  const pool = enabled.length > 0 ? enabled : _workerPool;
-  const limited = pool.filter((w) => !isWorkerHealthy(w.name));
-  if (limited.length !== pool.length || limited.length === 0) return null;
-  let nextReset = null;
-  for (const w of limited) {
-    const h = _workerHealth.get(w.name);
-    const until = h?.limitedUntil || (h?.limitedAt ? h.limitedAt + HEALTH_CHECK_MS : null);
-    if (until && (!nextReset || until < nextReset)) nextReset = until;
-  }
-  return { nextReset };
+  return workerHealth?.getAllLimitedStatus() || null;
 }
 
 function formatLimitNotice(resetAt) {
@@ -1939,8 +1860,10 @@ async function handleApiDirect(body, model, stream, source, req, res) {
   try {
     release = await queue.acquire(source, priority);
   } catch (err) {
-    return sendJson(res, 503, {
-      error: { message: `Queue full: ${err.message}`, type: "queue_full", retry_after_ms: 10000 },
+    return sendError(res, 503, {
+      message: `Queue full: ${err.message}`,
+      type: "queue_full",
+      retry_after_ms: 10000,
     }, { "retry-after": "10" });
   }
 
@@ -1950,9 +1873,7 @@ async function handleApiDirect(body, model, stream, source, req, res) {
     if (rateCheck.ok) break;
     if (rateWaitTotal >= 300000) {
       release();
-      return sendJson(res, 503, {
-        error: { message: "Rate limit wait exceeded", type: "rate_limit_timeout" },
-      });
+      return sendError(res, 503, { message: "Rate limit wait exceeded", type: "rate_limit_timeout" });
     }
     const sleepMs = Math.min(rateCheck.waitMs, 5000);
     await new Promise(r => setTimeout(r, sleepMs));
@@ -2040,7 +1961,7 @@ async function handleApiDirect(body, model, stream, source, req, res) {
       console.error(`[${ts()}] TOOL_REQ_ERROR reqId=${reqId} src=${source} ${err.message}`);
       eventLog.push("error", { reqId, mode: "anthropic_direct", model, source, error: err.message });
       sseBroadcast("error", { reqId, model, source, worker: tokenEntry.name, error: err.message });
-      sendJson(res, 500, { error: { message: err.message, type: "anthropic_api_error" } });
+      sendError(res, 500, { message: err.message, type: "anthropic_api_error" });
     }
   }
 }
@@ -2056,19 +1977,19 @@ async function handleCompletions(req, res) {
   try {
     rawBody = await readBody(req, MAX_BODY_BYTES);
   } catch (err) {
-    return sendJson(res, 413, { error: { message: err.message || "Payload too large" } });
+    return sendError(res, 413, { message: err.message || "Payload too large", type: "payload_too_large" });
   }
 
   let body;
   try {
     body = JSON.parse(rawBody);
   } catch {
-    return sendJson(res, 400, { error: { message: "Invalid JSON body" } });
+    return sendError(res, 400, { message: "Invalid JSON body", type: "invalid_request" });
   }
 
   const { messages, model: rawModel = "claude-code", stream = false } = body;
   if (!messages || !Array.isArray(messages)) {
-    return sendJson(res, 400, { error: { message: "messages array required" } });
+    return sendError(res, 400, { message: "messages array required", type: "invalid_request" });
   }
 
   // API direct path: only when CLI agent mode is off and tokens are available
@@ -2078,7 +1999,7 @@ async function handleCompletions(req, res) {
 
   const { prompt, systemPrompt } = extractPrompt(messages);
   if (!prompt) {
-    return sendJson(res, 400, { error: { message: "No user message found" } });
+    return sendError(res, 400, { message: "No user message found", type: "invalid_request" });
   }
 
   // Session affinity: derive a key so the same conversation sticks to the same worker
@@ -2118,8 +2039,10 @@ async function handleCompletions(req, res) {
   } catch (err) {
     // Only rejects if queue is truly full (100+ pending)
     console.log(`[${ts()}] QUEUE_FULL src=${source} model=${model} ${err.message}`);
-    return sendJson(res, 503, {
-      error: { message: `Queue full, try again shortly: ${err.message}`, type: "queue_full", retry_after_ms: 10000 },
+    return sendError(res, 503, {
+      message: `Queue full, try again shortly: ${err.message}`,
+      type: "queue_full",
+      retry_after_ms: 10000,
     }, { "retry-after": "10" });
   }
 
@@ -2132,8 +2055,9 @@ async function handleCompletions(req, res) {
     if (rateWaitTotal >= MAX_RATE_WAIT_MS) {
       release();
       console.log(`[${ts()}] RATE_TIMEOUT src=${source} model=${model} waited ${rateWaitTotal}ms`);
-      return sendJson(res, 503, {
-        error: { message: `Rate limit wait exceeded ${MAX_RATE_WAIT_MS}ms`, type: "rate_limit_timeout" },
+      return sendError(res, 503, {
+        message: `Rate limit wait exceeded ${MAX_RATE_WAIT_MS}ms`,
+        type: "rate_limit_timeout",
       });
     }
     const sleepMs = Math.min(rateCheck.waitMs, 5000);
@@ -2504,8 +2428,9 @@ ${fbResult}` : notice;
         } catch (err) {
           release();
           const retrySec = allLimited.nextReset ? Math.max(0, Math.round((allLimited.nextReset - Date.now()) / 1000)) : null;
-          return sendJson(res, 503, {
-            error: { message: `Claude limit reached; retry after ${retrySec ?? "unknown"}s`, type: "rate_limited" },
+          return sendError(res, 503, {
+            message: `Claude limit reached; retry after ${retrySec ?? "unknown"}s`,
+            type: "rate_limited",
             retry_after_sec: retrySec,
           });
         }
@@ -2539,8 +2464,9 @@ ${fbResult}` : notice;
         } catch (fbErr) {
           release();
           const retrySec = allLimited?.nextReset ? Math.max(0, Math.round((allLimited.nextReset - Date.now()) / 1000)) : null;
-          return sendJson(res, 503, {
-            error: { message: `Claude limit reached; retry after ${retrySec ?? "unknown"}s`, type: "rate_limited" },
+          return sendError(res, 503, {
+            message: `Claude limit reached; retry after ${retrySec ?? "unknown"}s`,
+            type: "rate_limited",
             retry_after_sec: retrySec,
           });
         }
@@ -2548,7 +2474,7 @@ ${fbResult}` : notice;
       release();
       eventLog.push("error", { reqId, mode: "sync", model, source, error: err.message });
       console.error(`[${ts()}] ERROR src=${source} ${err.message}`);
-      sendJson(res, 500, { error: { message: err.message, type: "internal_error" } });
+      sendError(res, 500, { message: err.message, type: "internal_error" });
     }
   }
 }
@@ -2579,7 +2505,7 @@ function handleHealth(req, res) {
   const qs = queue.getStats();
   const rs = registry.getStats();
   const workers = _workerPool.map((w) => {
-    const h = _workerHealth.get(w.name);
+    const h = workerHealth.getState(w.name);
     const until = h.limitedUntil || null;
     const healState = autoHeal.getWorkerState(w.name);
     return {
@@ -2588,7 +2514,7 @@ function handleHealth(req, res) {
       disabled: !!w.disabled,
       disabledReason: w.disabledReason || null,
       tokenReason: getWorkerTokenReason(w),
-      limited: h.limited,
+      limited: !!h.limited,
       limitedAt: h.limitedAt || null,
       limitedAgoSec: h.limited ? Math.round((Date.now() - h.limitedAt) / 1000) : null,
       limitedUntil: until,
@@ -2624,95 +2550,9 @@ function handleHealth(req, res) {
 }
 
 async function handleMetrics(req, res) {
-  const qs = queue.getStats();
-  const rs = registry.getStats();
   const url = new URL(req.url, `http://0.0.0.0:${PORT}`);
-  const sessionLimitRaw = parseInt(url.searchParams.get("sessions_limit") || "", 10);
-  const sessionOffsetRaw = parseInt(url.searchParams.get("sessions_offset") || "0", 10);
-  const defaultSessionLimit = CONFIG.sessionStats?.topN ?? 50;
-  const sessionLimit = Number.isFinite(sessionLimitRaw)
-    ? Math.max(1, Math.min(sessionLimitRaw, 500))
-    : defaultSessionLimit;
-  const sessionOffset = Number.isFinite(sessionOffsetRaw) ? Math.max(0, sessionOffsetRaw) : 0;
-  const sessions = sessionStatsStore
-    ? await sessionStatsStore.getStats({ limit: sessionLimit, offset: sessionOffset })
-    : { total: 0, limit: sessionLimit, offset: sessionOffset, retentionMs: 0, items: [] };
-  const cacheWindows = cacheStatsStore ? await cacheStatsStore.getWindowStats() : null;
-  const workers = _workerPool.map((w) => {
-    const h = _workerHealth.get(w.name);
-    const until = h.limitedUntil || null;
-    const healState = autoHeal.getWorkerState(w.name);
-    return {
-      name: w.name,
-      disabled: !!w.disabled,
-      disabledReason: w.disabledReason || null,
-      tokenReason: getWorkerTokenReason(w),
-      limited: h.limited,
-      limitedAt: h.limitedAt || null,
-      limitedUntil: until,
-      limitedRemainingSec: h.limited && until ? Math.max(0, Math.round((until - Date.now()) / 1000)) : null,
-      autoHeal: {
-        cooldownUntil: healState.cooldownUntil || null,
-        cooldownRemainingSec: healState.cooldownUntil ? Math.max(0, Math.round((healState.cooldownUntil - Date.now()) / 1000)) : null,
-        circuitState: healState.circuitState,
-        circuitOpenUntil: healState.circuitOpenUntil || null,
-        circuitRemainingSec: healState.circuitOpenUntil ? Math.max(0, Math.round((healState.circuitOpenUntil - Date.now()) / 1000)) : null,
-      },
-    };
-  });
-  const autoHealStats = autoHeal.getStats();
-  sendJson(res, 200, {
-    rateLimits: RATE_LIMITS,
-    rateUsage: rateLimiter.stats(),
-    tokens: tokenTracker.getStats(),
-    cliRouters: workers,
-    loadBalanceMode: _loadBalanceMode,
-    primaryRouter: PRIMARY_WORKER,
-    queue: qs,
-    processes: rs,
-    sessions,
-    cacheWindows,
-    config: {
-      version: CONFIG.dashboard.version,
-      useCliAgents: USE_CLI_AGENTS,
-      workerCount: _workerPool.length,
-      loadBalanceAlgorithm: "least-utilization",
-      maxConcurrent: MAX_CONCURRENT,
-      maxQueueTotal: MAX_QUEUE_TOTAL,
-      maxQueuePerSource: MAX_QUEUE_PER_SOURCE,
-      sourceConcurrencyLimits: SOURCE_CONCURRENCY_LIMITS,
-      defaultSourceConcurrency: DEFAULT_SOURCE_CONCURRENCY,
-      queueTimeoutMs: QUEUE_TIMEOUT_MS,
-      heartbeatByModel: HEARTBEAT_BY_MODEL,
-      defaultHeartbeatMs: DEFAULT_HEARTBEAT_MS,
-      streamTimeoutMs: STREAM_TIMEOUT_MS,
-      syncTimeoutMs: SYNC_TIMEOUT_MS,
-      maxProcessAgeMs: MAX_PROCESS_AGE_MS,
-      maxIdleMs: MAX_IDLE_MS,
-      reaperIntervalMs: REAPER_INTERVAL_MS,
-      sessionAffinityTtlMs: CONFIG.sessionAffinity?.ttlMs ?? 30 * 60 * 1000,
-      sessionStats: CONFIG.sessionStats,
-      cacheControl: CONFIG.cacheControl,
-      sseKeepaliveMs: 30_000,
-      maxRetries: MAX_RETRIES,
-      retryBaseMs: RETRY_BASE_MS,
-    },
-    sessionAffinity: sessionAffinity.getStats(),
-    cache: getCacheStats(),
-    workerStats,
-    workerStatsWindow: computeWorkerWindowStats(),
-    autoHeal: autoHealStats,
-    auto_heal_triggered: autoHealStats.triggered,
-    auto_heal_success: autoHealStats.success,
-    auto_heal_fail: autoHealStats.fail,
-    last_heal_at: autoHealStats.lastHealAt,
-    heal_reason: autoHealStats.lastHealReason,
-    circuit_state: autoHeal.getWorkerState(PRIMARY_WORKER).circuitState,
-    activeConnections: Object.fromEntries(_activeConns),
-    systemReaper: systemReaper.getStats(),
-    unifiedRateLimits: getUnifiedRateLimits(),
-    tokenRefreshStatus: tokenRefresher.getStatus(),
-  });
+  const payload = await metricsController.buildMetricsResponse(url);
+  sendJson(res, 200, payload);
 }
 
 function handleSystemReaper(req, res) {
@@ -2748,17 +2588,17 @@ async function handleKillZombie(req, res) {
   try {
     body = await readBody(req, MAX_BODY_BYTES);
   } catch (err) {
-    return sendJson(res, 413, { error: { message: err.message || "Payload too large" } });
+    return sendError(res, 413, { message: err.message || "Payload too large", type: "payload_too_large" });
   }
   let parsed;
   try {
     parsed = JSON.parse(body);
   } catch {
-    return sendJson(res, 400, { error: { message: "Invalid JSON body" } });
+    return sendError(res, 400, { message: "Invalid JSON body", type: "invalid_request" });
   }
 
   const { pid } = parsed;
-  if (!pid) return sendJson(res, 400, { error: { message: "pid required" } });
+  if (!pid) return sendError(res, 400, { message: "pid required", type: "invalid_request" });
 
   const result = registry.kill(Number(pid));
   eventLog.push("kill", { pid: Number(pid), manual: true });
@@ -2777,7 +2617,7 @@ function handleMetricsHistory(req, res, url) {
   const window = url.searchParams.get("window") || "1h";
   const validWindows = ["1h", "6h", "1d", "7d"];
   if (!validWindows.includes(window)) {
-    return sendJson(res, 400, { error: { message: `Invalid window. Use: ${validWindows.join(", ")}` } });
+    return sendError(res, 400, { message: `Invalid window. Use: ${validWindows.join(", ")}`, type: "invalid_request" });
   }
   const points = metricsStore.query(window);
   sendJson(res, 200, { window, points, count: points.length, bufferSize: metricsStore.getBufferSize() });
@@ -2789,7 +2629,7 @@ async function handlePortal(req, res) {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(html);
   } catch (err) {
-    sendJson(res, 500, { error: { message: "Portal file not found: " + err.message } });
+    sendError(res, 500, { message: "Portal file not found: " + err.message, type: "internal_error" });
   }
 }
 
@@ -2799,7 +2639,7 @@ async function handleProxyDashboard(req, res) {
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(html);
   } catch (err) {
-    sendJson(res, 500, { error: { message: "Dashboard file not found: " + err.message } });
+    sendError(res, 500, { message: "Dashboard file not found: " + err.message, type: "internal_error" });
   }
 }
 
@@ -2809,6 +2649,31 @@ async function handleProxyDashboard(req, res) {
 
 function ts() {
   return new Date().toISOString();
+}
+
+function classifyErrorCategory(type = "", status = 500) {
+  const t = String(type).toLowerCase();
+  if (t.includes("auth") || t.includes("unauthorized")) return "auth";
+  if (t.includes("rate") || t.includes("queue")) return "rate_limit";
+  if (t.includes("timeout")) return "timeout";
+  if (t.includes("upstream") || t.includes("api")) return "upstream";
+  if (status === 401) return "auth";
+  if (status === 429 || status === 503) return "rate_limit";
+  if (status === 504) return "timeout";
+  return "internal";
+}
+
+function sendError(res, status, { message, type = "internal_error", ...extra } = {}, extraHeaders = {}) {
+  const category = classifyErrorCategory(type, status);
+  sendJson(res, status, {
+    error: {
+      message,
+      type,
+      category,
+      code: category,
+      ...extra,
+    },
+  }, extraHeaders);
 }
 
 function sendJson(res, status, body, extraHeaders = {}) {
@@ -2881,7 +2746,7 @@ const server = createServer(async (req, res) => {
   // Auth check (skip for health, dashboard, events)
   const noAuthPaths = ["/health", "/dashboard", "/dashboard/", "/dashboard/proxy", "/dashboard/proxy/", "/events", "/metrics/history", "/stream", "/system-reaper"];
   if (!noAuthPaths.includes(url.pathname) && !authenticate(req)) {
-    return sendJson(res, 401, { error: { message: "Unauthorized" } });
+    return sendError(res, 401, { message: "Unauthorized", type: "unauthorized" });
   }
 
   try {
@@ -2915,7 +2780,7 @@ const server = createServer(async (req, res) => {
       const chunks = []; for await (const c of req) chunks.push(c);
       const { tokenName } = JSON.parse(Buffer.concat(chunks).toString());
       const entry = TOKEN_POOL.find(t => t.name === tokenName);
-      if (!entry) return sendJson(res, 404, { error: { message: `Token ${tokenName} not found` } });
+      if (!entry) return sendError(res, 404, { message: `Token ${tokenName} not found`, type: "not_found" });
       const result = await tokenRefresher.handleAuthError(entry);
       sendJson(res, 200, { result, status: tokenRefresher.getStatus() });
     } else if (url.pathname === "/dashboard/proxy" || url.pathname === "/dashboard/proxy/") {
@@ -2923,11 +2788,11 @@ const server = createServer(async (req, res) => {
     } else if (url.pathname === "/dashboard" || url.pathname === "/dashboard/") {
       await handlePortal(req, res);
     } else {
-      sendJson(res, 404, { error: { message: "Not found" } });
+      sendError(res, 404, { message: "Not found", type: "not_found" });
     }
   } catch (err) {
     console.error(`[${ts()}] UNHANDLED ${err.message}`);
-    sendJson(res, 500, { error: { message: "Internal server error" } });
+    sendError(res, 500, { message: "Internal server error", type: "internal_error" });
   }
 });
 

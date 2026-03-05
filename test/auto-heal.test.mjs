@@ -65,4 +65,14 @@ describe("auto-heal", () => {
     assert.equal(classification.kind, "rate_limit");
     assert.equal(classification.healable, false);
   });
+
+  it("should classify 401 as healable auth error", () => {
+    const classification = classifyCliError({
+      exitCode: 1,
+      stderr: "HTTP 401 Unauthorized",
+      stdout: "",
+    });
+    assert.equal(classification.kind, "auth");
+    assert.equal(classification.healable, true);
+  });
 });

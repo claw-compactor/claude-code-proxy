@@ -139,5 +139,10 @@
     "cooldownMs": 15000,
     "circuitFailThreshold": 3,
     "circuitOpenMs": 60000
+  },
+  "workerHealth": {
+    "circuitFailThreshold": 3,
+    "circuitOpenMs": 60000,
+    "circuitWindowMs": 60000
   }
 }

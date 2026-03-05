@@ -415,23 +415,28 @@ export function createSessionStatsStore({ storage, ttlMs = 24 * 60 * 60 * 1000, 
       five: 5 * 60 * 1000,
       fifteen: 15 * 60 * 1000,
       hour: 60 * 60 * 1000,
+      day: 24 * 60 * 60 * 1000,
     };
-    let req5m = 0, req15m = 0, req1h = 0;
+    let req5m = 0, req15m = 0, req1h = 0, req24h = 0;
     let hits = 0, misses = 0;
-    let hits5m = 0, hits15m = 0, hits1h = 0;
+    let hits5m = 0, hits15m = 0, hits1h = 0, hits24h = 0;
     for (const ev of entry.events) {
       if (ev.hit) hits++;
       else misses++;
       const age = tsNow - ev.ts;
-      if (age <= windows.hour) {
-        req1h++;
-        if (ev.hit) hits1h++;
-        if (age <= windows.fifteen) {
-          req15m++;
-          if (ev.hit) hits15m++;
-          if (age <= windows.five) {
-            req5m++;
-            if (ev.hit) hits5m++;
+      if (age <= windows.day) {
+        req24h++;
+        if (ev.hit) hits24h++;
+        if (age <= windows.hour) {
+          req1h++;
+          if (ev.hit) hits1h++;
+          if (age <= windows.fifteen) {
+            req15m++;
+            if (ev.hit) hits15m++;
+            if (age <= windows.five) {
+              req5m++;
+              if (ev.hit) hits5m++;
+            }
           }
         }
       }
@@ -441,12 +446,14 @@ export function createSessionStatsStore({ storage, ttlMs = 24 * 60 * 60 * 1000, 
       requests5m: req5m,
       requests15m: req15m,
       requests1h: req1h,
+      requests24h: req24h,
       hits,
       misses,
       hitRate: total > 0 ? (hits / total * 100).toFixed(1) + "%" : "0%",
       hitRate5m: req5m > 0 ? (hits5m / req5m * 100).toFixed(1) + "%" : "0%",
       hitRate15m: req15m > 0 ? (hits15m / req15m * 100).toFixed(1) + "%" : "0%",
       hitRate1h: req1h > 0 ? (hits1h / req1h * 100).toFixed(1) + "%" : "0%",
+      hitRate24h: req24h > 0 ? (hits24h / req24h * 100).toFixed(1) + "%" : "0%",
     };
   }
 
@@ -474,19 +481,24 @@ export function createSessionStatsStore({ storage, ttlMs = 24 * 60 * 60 * 1000, 
           five: tsNow - 5 * 60 * 1000,
           fifteen: tsNow - 15 * 60 * 1000,
           hour: tsNow - 60 * 60 * 1000,
+          day: tsNow - 24 * 60 * 60 * 1000,
         };
         const ev5 = await client.zrangebyscore(eventsKey, windows.five, "+inf");
         const ev15 = await client.zrangebyscore(eventsKey, windows.fifteen, "+inf");
         const ev1h = await client.zrangebyscore(eventsKey, windows.hour, "+inf");
+        const ev24h = await client.zrangebyscore(eventsKey, windows.day, "+inf");
         const hits5m = ev5.filter((ev) => String(ev).split(":")[1] === "1").length;
         const hits15m = ev15.filter((ev) => String(ev).split(":")[1] === "1").length;
         const hits1h = ev1h.filter((ev) => String(ev).split(":")[1] === "1").length;
+        const hits24h = ev24h.filter((ev) => String(ev).split(":")[1] === "1").length;
         item.requests5m = ev5.length;
         item.requests15m = ev15.length;
         item.requests1h = ev1h.length;
+        item.requests24h = ev24h.length;
         item.hitRate5m = ev5.length > 0 ? (hits5m / ev5.length * 100).toFixed(1) + "%" : "0%";
         item.hitRate15m = ev15.length > 0 ? (hits15m / ev15.length * 100).toFixed(1) + "%" : "0%";
         item.hitRate1h = ev1h.length > 0 ? (hits1h / ev1h.length * 100).toFixed(1) + "%" : "0%";
+        item.hitRate24h = ev24h.length > 0 ? (hits24h / ev24h.length * 100).toFixed(1) + "%" : "0%";
         const hits = (item.hits || 0);
         const misses = (item.misses || 0);
         const total = hits + misses;

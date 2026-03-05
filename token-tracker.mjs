@@ -26,8 +26,13 @@ const REDIS_KEY_REQUESTS = "tokens:requests";
 /**
  * @param {object} [options]
  * @param {object} [options.redis] - Redis client from redis-client.mjs
+ * @param {boolean} [options.fileBackup=true] - Enable local file persistence
+ * @param {string} [options.stateFile] - Override state file path
  */
-export function createTokenTracker({ redis } = {}) {
+export function createTokenTracker({ redis, fileBackup = true, stateFile } = {}) {
+  const fileBackupEnabled = fileBackup !== false;
+  const resolvedStateFile = stateFile || STATE_FILE;
+  const dataDir = dirname(resolvedStateFile);
   // In-memory state (always maintained as source of truth for this process)
   let models = {};
   let requests = new Map();
@@ -40,17 +45,19 @@ export function createTokenTracker({ redis } = {}) {
   // --------------------------------------------------
 
   async function ensureDataDir() {
-    if (!existsSync(DATA_DIR)) {
-      await mkdir(DATA_DIR, { recursive: true });
+    if (!fileBackupEnabled) return;
+    if (!existsSync(dataDir)) {
+      await mkdir(dataDir, { recursive: true });
     }
   }
 
   async function loadFromFile() {
+    if (!fileBackupEnabled) return false;
     try {
       await ensureDataDir();
-      if (!existsSync(STATE_FILE)) return false;
+      if (!existsSync(resolvedStateFile)) return false;
 
-      const raw = await readFile(STATE_FILE, "utf-8");
+      const raw = await readFile(resolvedStateFile, "utf-8");
       const data = JSON.parse(raw);
 
       if (data && typeof data.models === "object") {
@@ -72,6 +79,7 @@ export function createTokenTracker({ redis } = {}) {
   }
 
   function scheduleFileSave() {
+    if (!fileBackupEnabled) return;
     if (saveTimer) return;
     saveTimer = setTimeout(async () => {
       saveTimer = null;
@@ -82,7 +90,7 @@ export function createTokenTracker({ redis } = {}) {
           null,
           2
         );
-        await writeFile(STATE_FILE, data, "utf-8");
+        await writeFile(resolvedStateFile, data, "utf-8");
       } catch (err) {
         console.error(`[TokenTracker] File save error: ${err.message}`);
       }

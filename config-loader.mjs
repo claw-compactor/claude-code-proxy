@@ -318,6 +318,12 @@ export function loadConfig() {
     circuitOpenMs: resolve(file, "autoHeal.circuitOpenMs", "AUTO_HEAL_CIRCUIT_OPEN_MS", 60_000, toInt),
   };
 
+  const workerHealth = {
+    circuitFailThreshold: resolve(file, "workerHealth.circuitFailThreshold", "WORKER_HEALTH_CIRCUIT_FAIL_THRESHOLD", 3, toInt),
+    circuitOpenMs: resolve(file, "workerHealth.circuitOpenMs", "WORKER_HEALTH_CIRCUIT_OPEN_MS", 60_000, toInt),
+    circuitWindowMs: resolve(file, "workerHealth.circuitWindowMs", "WORKER_HEALTH_CIRCUIT_WINDOW_MS", 60_000, toInt),
+  };
+
   // --- Validation ---
 
   if (!Array.isArray(workers) || workers.length === 0) {
@@ -376,6 +382,7 @@ export function loadConfig() {
     dashboard,
     portal,
     autoHeal,
+    workerHealth,
   };
 
   // Deep freeze to prevent accidental mutation

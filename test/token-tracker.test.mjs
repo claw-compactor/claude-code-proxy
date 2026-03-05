@@ -19,7 +19,7 @@ describe("token-tracker", () => {
 
   describe("in-memory (no Redis)", () => {
     it("should record and retrieve tokens", () => {
-      const tt = createTokenTracker();
+      const tt = createTokenTracker({ fileBackup: false });
       tt.record("req-1", "sonnet", 100, 200);
 
       const totals = tt.getTotals();
@@ -30,7 +30,7 @@ describe("token-tracker", () => {
     });
 
     it("should accumulate tokens per model", () => {
-      const tt = createTokenTracker();
+      const tt = createTokenTracker({ fileBackup: false });
       tt.record("req-1", "sonnet", 100, 200);
       tt.record("req-2", "sonnet", 150, 250);
       tt.record("req-3", "opus", 500, 1000);
@@ -47,7 +47,7 @@ describe("token-tracker", () => {
     });
 
     it("should get per-request snapshot", () => {
-      const tt = createTokenTracker();
+      const tt = createTokenTracker({ fileBackup: false });
       tt.record("req-42", "haiku", 50, 75);
 
       const req = tt.getRequest("req-42");
@@ -59,12 +59,12 @@ describe("token-tracker", () => {
     });
 
     it("should return null for unknown request", () => {
-      const tt = createTokenTracker();
+      const tt = createTokenTracker({ fileBackup: false });
       assert.equal(tt.getRequest("nonexistent"), null);
     });
 
     it("should return frozen objects", () => {
-      const tt = createTokenTracker();
+      const tt = createTokenTracker({ fileBackup: false });
       tt.record("req-1", "sonnet", 100, 200);
 
       assert.ok(Object.isFrozen(tt.getTotals()));
@@ -73,7 +73,7 @@ describe("token-tracker", () => {
     });
 
     it("should getStats with both model and totals", () => {
-      const tt = createTokenTracker();
+      const tt = createTokenTracker({ fileBackup: false });
       tt.record("req-1", "sonnet", 100, 200);
 
       const stats = tt.getStats();
@@ -83,7 +83,7 @@ describe("token-tracker", () => {
     });
 
     it("should trim oldest requests over MAX_REQUESTS", () => {
-      const tt = createTokenTracker();
+      const tt = createTokenTracker({ fileBackup: false });
 
       // Record 1010 requests (limit is 1000)
       for (let i = 0; i < 1010; i++) {
@@ -103,7 +103,7 @@ describe("token-tracker", () => {
 
   describe("seedFromHistory", () => {
     it("should seed from historical snapshots", () => {
-      const tt = createTokenTracker();
+      const tt = createTokenTracker({ fileBackup: false });
 
       const snapshots = [
         { models: { sonnet: { i: 100, o: 200, r: 5 } } },
@@ -119,7 +119,7 @@ describe("token-tracker", () => {
     });
 
     it("should not seed if already has data", () => {
-      const tt = createTokenTracker();
+      const tt = createTokenTracker({ fileBackup: false });
       tt.record("req-1", "sonnet", 100, 200);
 
       const seeded = tt.seedFromHistory([{ models: { sonnet: { i: 999, o: 999, r: 99 } } }]);
@@ -127,7 +127,7 @@ describe("token-tracker", () => {
     });
 
     it("should handle counter resets (server restarts)", () => {
-      const tt = createTokenTracker();
+      const tt = createTokenTracker({ fileBackup: false });
 
       // Session 1: counts go up
       const snapshots = [
@@ -148,7 +148,7 @@ describe("token-tracker", () => {
   describe("with Redis", () => {
     it("should persist tokens to Redis HASH", async () => {
       redis = await createTestRedis();
-      const tt = createTokenTracker({ redis });
+      const tt = createTokenTracker({ redis, fileBackup: false });
       await tt.ready;
 
       tt.record("req-redis-1", "sonnet", 500, 750);
@@ -166,7 +166,7 @@ describe("token-tracker", () => {
     });
 
     it("should persist per-request to Redis HASH", async () => {
-      const tt = createTokenTracker({ redis });
+      const tt = createTokenTracker({ redis, fileBackup: false });
       await tt.ready;
 
       tt.record("req-redis-2", "opus", 200, 400);
@@ -182,13 +182,13 @@ describe("token-tracker", () => {
 
     it("should load from Redis on startup", async () => {
       // First instance writes data
-      const tt1 = createTokenTracker({ redis });
+      const tt1 = createTokenTracker({ redis, fileBackup: false });
       await tt1.ready;
       tt1.record("req-persist-1", "haiku", 100, 200);
       await sleep(200);
 
       // Second instance should load from Redis
-      const tt2 = createTokenTracker({ redis });
+      const tt2 = createTokenTracker({ redis, fileBackup: false });
       await tt2.ready;
 
       const byModel = tt2.getByModel();
