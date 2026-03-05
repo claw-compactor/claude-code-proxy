@@ -141,7 +141,7 @@ const TOKEN_POOL = buildTokenPool(_workerPool);
 const tokenHealthManager = createTokenHealthManager({
   tokenPool: TOKEN_POOL,
   ...CONFIG.tokenHealth,
-  eventLog,
+  eventLog: null,  // bound later via setEventLog() after eventLog is initialized
   log: console.log,
 });
 
@@ -486,6 +486,7 @@ const retryPolicy = createRetryPolicy({
 });
 
 const eventLog = createEventLog({ maxEvents: 500, redis });
+tokenHealthManager.setEventLog?.(eventLog);
 const tokenTracker = createTokenTracker({ redis });
 
 // Worker health controller: rate-limit cooldown + circuit breaker
