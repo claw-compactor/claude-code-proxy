@@ -85,8 +85,6 @@ export function createMetricsController({
     const sessions = sessionStatsStore
       ? await sessionStatsStore.getStats({ limit: sessionLimit, offset: sessionOffset })
       : { total: 0, limit: sessionLimit, offset: sessionOffset, retentionMs: 0, items: [] };
-    const cacheWindows = cacheStatsStore ? await cacheStatsStore.getWindowStats() : null;
-
     const workers = config.workers.map((w) => {
       const state = workerHealth.getState(w.name);
       const until = state.limitedUntil || null;
@@ -126,7 +124,6 @@ export function createMetricsController({
       queue: qs,
       processes: rs,
       sessions,
-      cacheWindows,
       config: {
         version: config.dashboard.version,
         useCliAgents: config.routing.useCliAgents,
@@ -157,12 +154,6 @@ export function createMetricsController({
       workerStats,
       workerStatsWindow: computeWorkerWindowStats(),
       autoHeal: autoHealStats,
-      auto_heal_triggered: autoHealStats.triggered,
-      auto_heal_success: autoHealStats.success,
-      auto_heal_fail: autoHealStats.fail,
-      last_heal_at: autoHealStats.lastHealAt,
-      heal_reason: autoHealStats.lastHealReason,
-      circuit_state: autoHeal.getWorkerState(config.routing.primaryWorker).circuitState,
       activeConnections: (() => {
         if (!activeConnections) return {};
         if (activeConnections instanceof Map) return Object.fromEntries(activeConnections);
@@ -172,7 +163,6 @@ export function createMetricsController({
       unifiedRateLimits: getUnifiedRateLimits?.() || {},
       rateLimitEnhanced: getTokenRoutingSnapshot?.() || {},
       tokenRefreshStatus: tokenRefresher?.getStatus?.() || null,
-      tokenProbe: tokenHealthProbe?.getResults?.() || {},
       tokenHealthStates: tokenHealthManager?.getSnapshot?.() || {},
       generatedAt: ts(),
     };

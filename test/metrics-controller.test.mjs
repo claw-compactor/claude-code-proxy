@@ -30,7 +30,7 @@ const fakeConfig = {
 };
 
 describe("metrics controller", () => {
-  it("should include legacy fields for /metrics compatibility", async () => {
+  it("should include essential fields for /metrics and omit removed fields", async () => {
     const workerHealth = createWorkerHealthController({ workers: [{ name: "1" }] });
 
     const controller = createMetricsController({
@@ -64,9 +64,14 @@ describe("metrics controller", () => {
     assert.ok(payload.cliRouters);
     assert.ok(payload.queue);
     assert.ok(payload.processes);
-    assert.ok(payload.auto_heal_triggered !== undefined);
-    assert.ok(payload.auto_heal_success !== undefined);
-    assert.ok(payload.auto_heal_fail !== undefined);
+    // Legacy flat fields removed — data lives in autoHeal object
+    assert.ok(payload.autoHeal);
+    assert.equal(payload.autoHeal.triggered, 0);
+    assert.equal(payload.autoHeal.success, 0);
+    assert.equal(payload.autoHeal.fail, 0);
+    assert.equal(payload.auto_heal_triggered, undefined);
+    assert.equal(payload.cacheWindows, undefined);
+    assert.equal(payload.tokenProbe, undefined);
     assert.ok(payload.workerStatsWindow);
   });
 });
