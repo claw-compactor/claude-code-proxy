@@ -1,99 +1,81 @@
 # claude-code-proxy
 
-OpenAI-compatible API proxy that routes requests to the Anthropic Claude API via OAuth tokens. Supports multiple independent accounts for load distribution, automatic token refresh, prompt caching, and a real-time monitoring dashboard.
+OpenAI-compatible and native Anthropic API proxy for Claude. Routes requests across multiple independent OAuth accounts for load distribution, with rate-limit-aware smart routing, aggressive token refresh, prompt caching optimization, and a real-time monitoring dashboard.
 
 ## Architecture
 
 ```
-Clients (OpenAI format)
-    │
-    ▼
-┌──────────────────────────────────┐
-│  claude-code-proxy  (port 8403)  │
-│                                  │
-│  ┌────────────────────────────┐  │
-│  │ Least-Utilization Router   │  │
-│  │ (picks token with lowest   │  │
-│  │  5h utilization %)         │  │
-│  └──────┬──────┬──────┬───────┘  │
-│         │      │      │          │
-│    Token 1  Token 2  Token 3     │
-│    (Org A)  (Org B)  (Org C)     │
-│                                  │
-│  Fair Queue · Rate Limiter       │
-│  Session Affinity · Cache Ctrl   │
-│  Token Refresh · System Reaper   │
-└──────────────┬───────────────────┘
-               │
-               ▼
-      Anthropic API (api.anthropic.com)
+Clients
+ ├─ OpenAI format   (/v1/chat/completions)
+ └─ Anthropic format (/v1/messages)
+         │
+         ▼
+┌──────────────────────────────────────────┐
+│      claude-code-proxy  (port 8403)      │
+│                                          │
+│  ┌────────────────────────────────────┐  │
+│  │   Rate-Limit-Aware Smart Router   │  │
+│  │                                    │  │
+│  │  available (<75%) → round-robin    │  │
+│  │  strained (75-99%) → lowest util  │  │
+│  │  saturated (≥99%) → avoided       │  │
+│  └────┬──────┬──────┬──────┬─────────┘  │
+│       │      │      │      │            │
+│   Token 1  Token 2  Token 3  Token 4    │
+│   (Org A)  (Org B)  (Org C)  (Org D)   │
+│                                          │
+│  Fair Queue · Per-Model Rate Limiter     │
+│  Session Affinity · Prompt Caching       │
+│  Token Refresh · Circuit Breaker         │
+│  Auto-Heal · System Reaper               │
+└──────────────────┬───────────────────────┘
+                   │
+                   ▼
+         Anthropic Messages API
+        (api.anthropic.com)
 ```
 
-### Control Layer (Controllers)
+## Features
 
-- **StorageController** — unified Redis/local fallback for cache/session/worker stats
-- **MetricsController** — metrics aggregation + /metrics compatibility output
-- **WorkerHealthController** — worker health state machine with circuit breaker + cooldown recovery
+- **Dual format support**: OpenAI `/v1/chat/completions` and native Anthropic `/v1/messages`
+- **Rate-limit-aware routing**: Classifies tokens by utilization tier, avoids saturated accounts
+- **Prompt caching**: System prefix caching + tool/message breakpoint injection (~88% cache hit rate)
+- **Aggressive token refresh**: Parallel startup refresh, 50% lifetime proactive renewal, keychain/CLI recovery
+- **Fair queuing**: Per-source isolation with configurable concurrency limits
+- **Session affinity**: Sticky routing for conversation cache optimization
+- **Circuit breaker**: Health state machine with automatic recovery
+- **Auto-heal**: Request-level auth failure recovery with token refresh retry
+- **Real-time dashboard**: Live metrics, rate limits, cache stats, worker health
+- **Redis persistence**: Cross-restart state with local JSON fallback
 
-### Request Flow
-
-1. Client sends OpenAI-format request (`/v1/chat/completions`)
-2. Proxy converts to Anthropic Messages API format
-3. Least-utilization router picks the token with lowest 5h usage
-4. Request sent to Anthropic with OAuth bearer token + beta header
-5. Response converted back to OpenAI format and returned
-
-### Key Modules
-
-| Module | Purpose |
-|--------|---------|
-| `server.mjs` | Main server: routing, API translation, streaming |
-| `controllers/storage-controller.mjs` | Unified storage control (Redis/local fallback) |
-| `controllers/metrics-controller.mjs` | Metrics aggregation + compatibility output |
-| `controllers/worker-health-controller.mjs` | Worker health state machine + circuit breaker |
-| `storage-backend.mjs` | Redis/local persistence for analytics snapshots |
-| `config-loader.mjs` | Loads and validates `proxy.config.json` |
-| `token-refresh.mjs` | OAuth token auto-refresh (proactive + on-401) |
-| `auto-heal.mjs` | Request-level auto-heal for CLI auth failures |
-| `fair-queue.mjs` | Per-source fair queuing with concurrency limits |
-| `rate-limiter.mjs` | Local rate limiting (requests/min, tokens/min) |
-| `session-affinity.mjs` | Sticky sessions for prompt cache optimization |
-| `session-cache-stats.mjs` | Per-session cache hit/miss analytics |
-| `metrics-store.mjs` | Time-series metrics with Redis persistence |
-| `process-registry.mjs` | CLI process lifecycle tracking |
-| `event-log.mjs` | Structured event log with Redis persistence |
-| `token-tracker.mjs` | Token usage accounting per model/source |
-| `worker-pool.mjs` | CLI worker management (fallback path) |
-| `system-reaper.mjs` | Automatic cleanup of stale processes |
-| `response-formats.mjs` | OpenAI response format builders |
-| `redis-client.mjs` | Redis connection factory |
-| `retry.mjs` | Exponential backoff retry logic |
-
-## Setup
+## Quick Start
 
 ### Prerequisites
 
-- Node.js 20+
-- Redis (recommended for analytics persistence; proxy falls back to local backup when unavailable)
-- One or more Claude Max subscription accounts with OAuth tokens
+- Node.js 20+ (tested on v25.6.0)
+- Redis (recommended; proxy degrades gracefully without it)
+- One or more Claude accounts with OAuth tokens
 
 ### Install
 
 ```bash
+git clone git@github.com:claw-compactor/claude-code-proxy.git
+cd claude-code-proxy
 npm install
 cp proxy.config.sample.json proxy.config.json
 ```
 
-### Configure tokens
+### Configure Tokens
 
-Each worker needs an OAuth access token and (optionally) a refresh token. Tokens come from the Claude Code OAuth flow:
+Each worker needs an OAuth access token and refresh token from the Claude Code OAuth flow:
 
-1. Run `claude auth login` from a Claude Code CLI session
-2. Copy the resulting `accessToken` and `refreshToken` into `proxy.config.json`
+```bash
+# On each Claude account:
+claude auth login
+# Copy accessToken + refreshToken into proxy.config.json
+```
 
-Workers with refresh tokens auto-renew before expiry. Workers without refresh tokens need manual token replacement every ~8 hours.
-
-For multiple independent rate limit pools, use tokens from **different Claude accounts** (different organizations). Tokens from the same account share the same rate limits.
+Workers with `refreshToken` auto-renew. For independent rate limit pools, use tokens from **different Claude organizations**.
 
 ### Run
 
@@ -101,194 +83,423 @@ For multiple independent rate limit pools, use tokens from **different Claude ac
 # Foreground
 node server.mjs
 
-# Background (via helper script)
-./start.sh --bg
+# Background with logging
+./start.sh --bg       # Logs to /tmp/claude-proxy.log
 
-# Development (auto-reload on changes)
+# Development (auto-reload)
 npm run dev
 ```
 
-## API
+## API Reference
 
 ### Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/v1/chat/completions` | POST | OpenAI-compatible chat completion (sync + streaming) |
-| `/health` | GET | Health check with worker status |
-| `/metrics` | GET | Detailed metrics (tokens, latency, cache, queue, per-worker traffic) |
+| `/v1/messages` | POST | Native Anthropic Messages API (sync + streaming) |
+| `/health` | GET | Health check with worker status, queue depth |
+| `/metrics` | GET | Comprehensive metrics JSON |
 | `/dashboard` | GET | Real-time monitoring dashboard |
 | `/portal` | GET | Portal page with embedded dashboard |
 | `/events` | GET | SSE stream for live dashboard updates |
-
-`/metrics` includes `workerStats` (realtime totals) and `workerStatsWindow` (last 1h deltas) so the dashboard can compare workers even after restarts. Cache/session analytics are persisted in Redis (with a local JSON fallback) for restart safety.
+| `/models` | GET | List supported models |
+| `/worker/:name/disable` | POST | Graceful drain + disable worker |
+| `/worker/:name/enable` | POST | Re-enable worker |
+| `/zombies` | GET | List detected orphan processes |
 
 ### Supported Models
 
-Requests use short aliases that map to Anthropic model IDs:
+| Alias | Anthropic Model ID |
+|-------|--------------------|
+| `haiku`, `haiku-4.5`, `claude-haiku-4-5` | `claude-haiku-4-5-20251001` |
+| `sonnet`, `sonnet-4.6`, `claude-sonnet-4-6` | `claude-sonnet-4-6` |
+| `opus`, `opus-4.6`, `claude-opus-4-6` | `claude-opus-4-6` |
+| `claude-code` (default) | `claude-sonnet-4-6` |
 
-| Alias | Anthropic Model |
-|-------|----------------|
-| `haiku`, `haiku-4.5`, `claude-haiku-4-5` | claude-haiku-4-5-20251001 |
-| `sonnet`, `sonnet-4.6`, `claude-sonnet-4-6` | claude-sonnet-4-6 |
-| `opus`, `opus-4.6`, `claude-opus-4-6` | claude-opus-4-6 |
-| `claude-code` | claude-sonnet-4-6 (default) |
-
-### Example Request
+### OpenAI Format
 
 ```bash
 curl -X POST http://localhost:8403/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_AUTH_TOKEN" \
   -d '{
     "model": "sonnet",
     "messages": [{"role": "user", "content": "Hello"}],
-    "max_tokens": 100
+    "max_tokens": 100,
+    "stream": true
   }'
 ```
+
+### Native Anthropic Format
+
+```bash
+curl -X POST http://localhost:8403/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_AUTH_TOKEN" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "sonnet",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 100,
+    "stream": true
+  }'
+```
+
+Native Anthropic requests are passed through without format conversion. SSE events are piped directly, preserving all Anthropic-specific features (tool use, cache metrics, etc.).
+
+### Explicit Token Routing
+
+Route to a specific worker by name:
+
+```bash
+# Via header
+curl ... -H "x-token-name: 3"
+
+# Via body
+curl ... -d '{"tokenName": "3", ...}'
+```
+
+Controlled by `routing.allowExplicitTokenOverride` (default: `true`).
 
 ### Usage Fields
 
-`/v1/chat/completions` responses include Anthropic cache usage passthrough:
-- `input_tokens`, `output_tokens`
-- `cache_creation_input_tokens`, `cache_read_input_tokens`
-- legacy-compatible fields: `prompt_tokens`, `completion_tokens`, `total_tokens`
+Responses include Anthropic cache usage:
 
-### Explicit Token Routing (worker3)
-
-Optionally route a request to a specific worker by name:
-
-- Header: `x-token-name: worker3`
-- Body: `{ "tokenName": "worker3" }`
-
-If omitted, the proxy keeps the existing least-utilization routing behavior.
-
-This override can be disabled via `routing.allowExplicitTokenOverride` (default: true).
-
-```bash
-curl -X POST http://localhost:8403/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "x-token-name: worker3" \
-  -d '{
-    "model": "sonnet",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "max_tokens": 100
-  }'
+```json
+{
+  "usage": {
+    "input_tokens": 100,
+    "output_tokens": 50,
+    "cache_creation_input_tokens": 10,
+    "cache_read_input_tokens": 90,
+    "prompt_tokens": 200,
+    "completion_tokens": 50,
+    "total_tokens": 250
+  }
+}
 ```
+
+## Project Structure
+
+```
+claude-code-proxy/
+├── server.mjs                    Main server: wiring, routes, lifecycle
+│
+├── lib/                          Core modules (extracted from server.mjs)
+│   ├── anthropic-client.mjs      Anthropic API client (stream + sync + native)
+│   ├── request-handler.mjs       Request processing pipeline
+│   ├── format-converter.mjs      Format conversion + caching helpers
+│   ├── anthropic-compat.mjs      Anthropic↔OpenAI format translation
+│   ├── rate-limit-classifier.mjs Rate limit tier classification
+│   ├── token-pool.mjs            Token selection + cooldowns
+│   ├── worker-router.mjs         Rate-limit-aware load balancing
+│   ├── worker-state.mjs          Runtime worker enable/disable
+│   ├── token-health-probe.mjs    Periodic token validity probes
+│   ├── cli-runner.mjs            Claude CLI spawn/execute
+│   ├── fallback-client.mjs       Last-resort OpenAI-compatible API
+│   └── admin-routes.mjs          /health, /metrics, /events, /dashboard
+│
+├── controllers/
+│   ├── metrics-controller.mjs    Metrics aggregation + response builder
+│   ├── storage-controller.mjs    Unified Redis/local persistence
+│   └── worker-health-controller.mjs  Health state machine + circuit breaker
+│
+├── [Root modules]
+│   ├── config-loader.mjs         Config loading + validation
+│   ├── token-refresh.mjs         OAuth token auto-refresh
+│   ├── auto-heal.mjs             Request-level auth failure recovery
+│   ├── fair-queue.mjs            Per-source fair queuing
+│   ├── rate-limiter.mjs          Local per-model rate limiting
+│   ├── session-affinity.mjs      Session → worker sticky routing
+│   ├── session-cache-stats.mjs   Per-session cache analytics
+│   ├── metrics-store.mjs         Time-series metrics + Redis persistence
+│   ├── event-log.mjs             Circular event buffer
+│   ├── process-registry.mjs      CLI process lifecycle tracking
+│   ├── token-tracker.mjs         Per-model token accounting
+│   ├── redis-client.mjs          ioredis connection factory
+│   ├── storage-backend.mjs       Unified persistence (Redis/local)
+│   ├── system-reaper.mjs         Orphan process cleanup
+│   ├── response-formats.mjs      OpenAI response format builders
+│   ├── worker-pool.mjs           CLI worker warm-pool
+│   └── retry.mjs                 Exponential backoff
+│
+├── test/                         23 test files, 221 tests
+│   ├── format-converter.test.mjs
+│   ├── rate-limit-classifier.test.mjs
+│   ├── token-pool.test.mjs
+│   ├── worker-router.test.mjs
+│   ├── integration.test.mjs
+│   └── ...
+│
+├── dashboard.html                Real-time monitoring UI
+├── portal.html                   Portal page with iframe
+├── proxy.config.json             Active configuration (gitignored)
+├── proxy.config.sample.json      Configuration template
+├── start.sh                      Launch script (fg/bg)
+└── data/                         Persistent state (JSON backups)
+```
+
+## Core Systems
+
+### Rate-Limit-Aware Routing
+
+The proxy classifies each token by Anthropic's unified rate limits (5-hour and 7-day windows):
+
+| Tier | Utilization | Behavior |
+|------|-------------|----------|
+| **available** | < 75% | Round-robin (even distribution) |
+| **strained** | 75% – 99% | Route to lowest utilization |
+| **saturated** | ≥ 99% or rejected | Avoided; used only as last resort |
+| **unknown** | No probe data | Treated as available (backward compat) |
+
+The routing applies to both:
+- **API Direct path** (`lib/token-pool.mjs`): Token selection for direct Anthropic API calls
+- **CLI path** (`lib/worker-router.mjs`): Worker selection for CLI-routed requests
+
+Session affinity only applies when the target worker is in the current tier's filtered pool, preventing sticky routing to saturated workers.
+
+### Prompt Caching
+
+The proxy maximizes Anthropic prompt cache usage through three layers:
+
+1. **System prefix caching**: The first ~1200 chars of the system prompt are marked with `cache_control: { type: "ephemeral" }`, with a normalized cache key to handle whitespace variations.
+
+2. **Tool definition caching**: The last tool in the `tools` array gets a cache breakpoint, caching all tool definitions (they rarely change within a session).
+
+3. **Conversation history caching**: The second-to-last message gets a cache breakpoint, caching all prior conversation turns.
+
+This achieves ~88% cache hit rate on multi-turn conversations, reducing input costs significantly.
+
+Cache keys are scoped by: tenant + session + model + system prefix hash + tools hash.
+
+### Token Refresh
+
+Aggressive proactive refresh ensures tokens never expire during requests:
+
+| Feature | Detail |
+|---------|--------|
+| **Startup refresh** | Immediately refreshes all expired/near-expiry tokens in parallel |
+| **Half-life refresh** | Refreshes at 50% remaining lifetime (~4h for 8h tokens) |
+| **Proactive margin** | 1 hour before expiry |
+| **Check interval** | Every 30 seconds |
+| **Credential recovery** | On `invalid_grant`: re-reads macOS Keychain → tries `claude auth status` |
+| **Coalescing** | Concurrent 401s share a single refresh call |
+| **Persistence** | Atomic write to `proxy.config.json` + macOS Keychain |
+| **Backoff** | Exponential backoff on failures (max 5 min) |
+
+### Fair Queuing
+
+Per-source isolation prevents any single client from monopolizing the proxy:
+
+- Global concurrent request limit (default: 6)
+- Per-source queue depth limits
+- Per-source concurrency limits (configurable per source name)
+- Round-robin scheduling across sources
+
+### Circuit Breaker
+
+Worker health state machine:
+
+```
+healthy → degraded → open → recovering → healthy
+```
+
+- Tracks consecutive failures within a time window
+- Opens circuit after threshold failures (rejects new requests)
+- Auto-recovers after cooldown period with probe requests
+
+### Auto-Heal
+
+Request-level auth failure recovery:
+
+1. Detects 401/auth errors in CLI output
+2. Triggers OAuth token refresh
+3. Cooldown period (prevents refresh storms)
+4. Retries on same worker with fresh token
+5. Falls back to alternate worker if retry fails
 
 ## Configuration Reference
 
-See `proxy.config.sample.json` for a full template. Key sections:
+Full template: `proxy.config.sample.json`
 
 ### `server`
-- `port`: Listen port (default: 8403)
-- `authToken`: Bearer token for client auth (empty = open)
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `port` | `8403` | Listen port |
+| `authToken` | `""` | Bearer token for client auth (empty = open) |
 
 ### `workers[]`
-- `name`: Unique worker identifier
-- `token`: OAuth access token (`sk-ant-oat01-...`)
-- `refreshToken`: OAuth refresh token (`sk-ant-ort01-...`)
-- `expiresAt`: Token expiry (unix ms)
-- `disabled`: Set `true` to skip this worker
+
+| Key | Description |
+|-----|-------------|
+| `name` | Unique worker identifier |
+| `token` | OAuth access token (`sk-ant-oat01-...`) |
+| `refreshToken` | OAuth refresh token (`sk-ant-ort01-...`) |
+| `expiresAt` | Token expiry (unix ms) |
+| `disabled` | Set `true` to skip this worker |
+| `note` | Human-readable description |
 
 ### `routing`
-- `primaryWorker`: Preferred worker for CLI fallback path
-- `useCliAgents`: Enable CLI agent mode (tool-enabled requests)
-- `loadBalance`: Reserved for future use
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `primaryWorker` | `"3"` | Preferred worker for CLI fallback |
+| `useCliAgents` | `false` | Enable CLI agent mode (tool-enabled) |
+| `allowExplicitTokenOverride` | `true` | Allow `x-token-name` header |
+| `healthCheckMs` | `30000` | Health check interval |
 
 ### `rateLimits`
-Per-model local rate limits (applied before Anthropic's limits):
-- `requestsPerMin`: Max requests per minute
-- `tokensPerMin`: Max estimated tokens per minute
+
+Per-model local rate limits (applied before Anthropic's):
+
+```json
+{
+  "sonnet": { "requestsPerMin": 57, "tokensPerMin": 190000 },
+  "opus":   { "requestsPerMin": 28, "tokensPerMin": 57000 },
+  "haiku":  { "requestsPerMin": 95, "tokensPerMin": 380000 }
+}
+```
 
 ### `cacheControl`
-Anthropic prompt cache optimization:
-- `enabled`: Toggle cache_control injection
-- `systemPrefixChars`: Stable prefix length to cache
-- `minSystemPrefixChars`: Minimum prefix to bother caching
-- `normalizeSystemPrefix`: Normalize system prefix (trim, normalize newlines)
-- `debounceWhitespace`: Collapse whitespace noise for stable cache keys
-- `sessionScope`: `x-session-id` (default) or `none` for cross-session cache sharing
 
-See `docs/cache-optimization.md` for hit-rate tactics and anti-patterns.
-
-### `storage`
-Unified analytics persistence:
-- `backend`: `redis` (default) or `local` for file-only fallback
-
-### Auto-Heal (CLI auth recovery)
-
-The proxy can auto-heal worker auth failures by refreshing OAuth tokens, cooling down, and retrying on the same worker before failing over.
-
-See `docs/auto-heal.md` for trigger conditions, circuit breaker rules, and metrics.
-
-### `sessionStats`
-Per-session cache analytics:
-- `ttlMs`: Retain per-session events for this long (default: 24h)
-- `cleanupIntervalMs`: Prune expired sessions on this interval (default: 5m)
-- `topN`: Default sessions returned by `/metrics` (default: 50)
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Toggle cache_control injection |
+| `systemPrefixChars` | `1200` | Stable prefix length to cache |
+| `minSystemPrefixChars` | `200` | Min prefix to bother caching |
+| `normalizeSystemPrefix` | `true` | Normalize whitespace for stable keys |
+| `debounceWhitespace` | `true` | Collapse whitespace noise |
+| `sessionScope` | `"x-session-id"` | Session key source (`"none"` for cross-session sharing) |
 
 ### `queue`
-Fair queuing with per-source isolation:
-- `maxConcurrent`: Global concurrent request limit
-- `maxQueuePerSource`: Per-source queue depth
-- `sourceConcurrencyLimits`: Per-source concurrent limits
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `maxConcurrent` | `6` | Global concurrent request limit |
+| `maxQueueTotal` | `200` | Total queue depth |
+| `maxQueuePerSource` | `50` | Per-source queue depth |
+| `queueTimeoutMs` | `300000` | Max queue wait (5 min) |
+| `sourceConcurrencyLimits` | `{}` | Per-source caps (e.g., `{"batch": 15}`) |
 
 ### `timeouts`
-- `streamTimeoutMs`: Max time for streaming responses (default: 2h)
-- `syncTimeoutMs`: Max time for sync responses (default: 30min)
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `streamTimeoutMs` | `7200000` | Max streaming response time (2h) |
+| `syncTimeoutMs` | `1800000` | Max sync response time (30min) |
 
 ### `heartbeat`
-Per-model SSE keepalive intervals to prevent client timeouts.
 
-## Token Refresh
+Per-model SSE keepalive intervals (ms) to prevent client timeouts:
 
-Workers with `refreshToken` set benefit from automatic renewal:
+```json
+{ "opus": 600000, "sonnet": 300000, "haiku": 180000 }
+```
 
-- **Proactive**: Checked every 60s; refreshed 5 minutes before expiry
-- **Reactive**: On 401 auth error, triggers immediate refresh
-- **Coalesced**: Concurrent 401s share a single refresh call
-- **Persisted**: New tokens saved to `proxy.config.json` + macOS Keychain
-- **Backoff**: Exponential backoff on refresh failures (max 5 min)
+### `sessionStats`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `ttlMs` | `86400000` | Session event retention (24h) |
+| `cleanupIntervalMs` | `300000` | Prune interval (5 min) |
+| `topN` | `50` | Default sessions in `/metrics` |
+
+### `autoHeal`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `cooldownMs` | `60000` | Cooldown after auth failure |
+| `maxRetries` | `1` | Retries per request |
+| `circuitThreshold` | `3` | Failures to open circuit |
+| `circuitResetMs` | `60000` | Circuit breaker cooldown |
 
 ## Monitoring
 
-### Worker3 Watchdog
-
-See `docs/worker3-watchdog.md` for the 5‑minute watchdog script that probes worker3, auto-refreshes token 3, and restarts the proxy on failure.
-
 ### Dashboard (`/dashboard`)
 
-Real-time dashboard showing:
+Real-time monitoring dashboard showing:
+
 - Active/queued requests per worker
 - Token usage and costs by model
-- Rate limit utilization (5h and 7d)
-- Request latency percentiles
-- Cache hit rates and TTFT comparison
+- Rate limit utilization (5h and 7d windows) with tier badges
+- Routing status per worker (PREFERRED / ACTIVE / AVOIDED / BLOCKED)
+- Bottleneck indicators (which rate limit window is limiting)
+- Reset countdowns for rate-limited workers
+- Request latency percentiles (P50, P95, P99)
+- Cache hit rates and TTFT comparison (cached vs uncached)
 - Per-session cache analytics (5m/15m/1h hit rates)
+- Event log (last 100 events)
 
 ### Metrics (`/metrics`)
 
-Supports session pagination via `?sessions_limit=50&sessions_offset=0`.
+JSON endpoint with paginated session analytics:
 
-JSON endpoint with:
-- Per-model token counts and request counts
-- Per-worker utilization and health
-- Queue depth and wait times
-- Cache statistics
-- Session cache analytics (paginated)
-- Token refresh status
+```
+GET /metrics?sessions_limit=50&sessions_offset=0
+```
+
+Key fields:
+- `workerStats`: Per-worker request/error counts (realtime)
+- `workerStatsWindow`: Per-worker 1h delta (for comparison after restarts)
+- `unifiedRateLimits`: Raw 5h/7d utilization per worker
+- `rateLimitEnhanced`: Tier classification, routing status, reset countdown per worker
+- `tokenRefreshStatus`: Per-worker refresh state, expiry, error history
+- `cache`: Hit rate, TTFT averages, candidate/applied counts
+- `sessionCacheAnalytics`: Per-session cache performance (paginated)
+- `queue`: Active/queued counts, per-source breakdown
+- `tokenProbe`: Health probe results per worker
+
+## Testing
+
+```bash
+# Run all 221 tests
+npm test
+
+# Run specific test file
+node --test test/format-converter.test.mjs
+
+# Run with verbose output
+node --test --test-reporter=spec
+```
+
+Test coverage includes:
+- Format conversion + caching helpers (46 tests)
+- Rate limit classification (24 tests)
+- Token pool tiered selection (16 tests)
+- Worker routing (18 tests)
+- Token health probes (12 tests)
+- Worker state management (10 tests)
+- Integration tests (API + streaming)
+- Rate limiter, metrics store, event log, process registry
+- Redis client, storage backend, auto-heal, session stats
 
 ## Security
 
 - **Never commit real tokens.** `proxy.config.json` is in `.gitignore`.
 - Use `proxy.config.sample.json` as a template.
-- Tokens can also be injected via `WORKERS` env var (see `secrets.example`).
-- Set `server.authToken` to require bearer auth from clients.
+- Tokens can be injected via `WORKERS` env var.
+- Set `server.authToken` to require bearer auth from all clients.
+- Error messages are sanitized — no token values in responses.
+- macOS Keychain used for secure credential storage.
 
-## Tests
+## Design Principles
 
-```bash
-npm test
-```
+- **Dependency injection**: All modules use factory functions with explicit deps
+- **Immutability**: Public methods return new objects, never mutate state
+- **Pure functions**: Format converters and classifiers have no side effects
+- **Many small files**: High cohesion, low coupling (see `lib/`)
+- **Redis-first with fallback**: Graceful degradation when Redis unavailable
+- **Zero external API dependencies**: Uses only `node:https` (no SDK)
+- **Single runtime dependency**: `ioredis` for Redis
 
-Runs unit tests for: rate-limiter, token-tracker, metrics-store, event-log, process-registry, redis-client, and integration tests.
+## Additional Documentation
+
+- `docs/architecture.md` — Module dependency graph and relationships
+- `docs/auto-heal.md` — Auto-heal trigger conditions and circuit breaker
+- `docs/cache-optimization.md` — Cache hit-rate tactics and anti-patterns
+- `docs/cache-test-results.md` — Prompt caching smoke test results
+- `docs/session-analytics.md` — Per-session cache tracking
+- `docs/storage-architecture.md` — Redis-first persistence design
+- `docs/worker3-watchdog.md` — External watchdog script
